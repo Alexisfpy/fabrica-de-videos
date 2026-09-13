@@ -1,13 +1,14 @@
 import asyncio
+import base64
+import subprocess
 import io
 import json
 import os
 import re
 import subprocess
-import threading
 import time
-import urllib.parse
 import urllib.request
+import urllib.error
 import uuid
 from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
@@ -15,7 +16,6 @@ import edge_tts
 from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
-import random
 
 load_dotenv(find_dotenv())
 
@@ -23,45 +23,45 @@ VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3.6-flash")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
 
-POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
+# --- Configuración Cloudflare Workers AI ---
+CF_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+CF_MODEL = os.getenv("CLOUDFLARE_AI_MODEL", "@cf/black-forest-labs/flux-1-schnell")
 
-if not POLLINATIONS_API_KEY:
-    # IMPORTANTE: según la documentación oficial de Pollinations, "nologo" solo
-    # funciona con una cuenta registrada (token generado en https://auth.pollinations.ai).
-    # Sin token, nologo=true no tiene ningún efecto y el logo seguirá apareciendo
-    # SIEMPRE, por diseño de su API — no es un bug de este código.
-    print(
-        "[AVISO] POLLINATIONS_API_KEY no está configurada: el logo de Pollinations "
-        "aparecerá en todas las imágenes (nologo=true requiere una cuenta registrada "
-        "en https://auth.pollinations.ai). Además, sin cuenta, el límite de peticiones "
-        "es de 1 cada 15 segundos, lo que puede causar fallos en storyboards largos."
-    )
+_cf_last_call = 0.0
+_CF_MIN_INTERVAL = 1.0
 
 ASSETS_DIR = Path("renders/assets")
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 RENDERS_DIR = Path("renders")
 RENDERS_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Limitador de ritmo para Pollinations ---
-# Anónimo: 1 petición / 15s. Con cuenta registrada (nivel "Seed" o superior): 1 / 5s.
-# Antes el código solo esperaba 2s fijos entre imágenes, muy por debajo del límite
-# anónimo real, lo que provocaba 429 en cadena en storyboards largos (y de ahí las
-# tarjetas azules de repuesto "por causa desconocida").
-_POLLINATIONS_MIN_INTERVAL = 6.0 if POLLINATIONS_API_KEY else 16.0
-_pollinations_lock = threading.Lock()
-_pollinations_last_call = 0.0
 
+def _esperar_turno_cloudflare():
+    global _cf_last_call
+    ahora = time.monotonic()
+    espera = _CF_MIN_INTERVAL - (ahora - _cf_last_call)
+    if espera > 0:
+        time.sleep(espera)
+    _cf_last_call = time.monotonic()
 
-def _esperar_turno_pollinations():
-    """Bloquea lo necesario para no superar el límite de peticiones de Pollinations."""
-    global _pollinations_last_call
-    with _pollinations_lock:
-        ahora = time.monotonic()
-        espera = _POLLINATIONS_MIN_INTERVAL - (ahora - _pollinations_last_call)
-        if espera > 0:
-            time.sleep(espera)
-        _pollinations_last_call = time.monotonic()
+def _crop_to_16_9(img: Image.Image) -> Image.Image:
+    """Recorte central inteligente a formato 16:9 sin deformar la imagen."""
+    w, h = img.size
+    target_aspect = 16 / 9
+    current_aspect = w / h
 
+    if abs(current_aspect - target_aspect) < 0.01:
+        return img
+
+    if current_aspect < target_aspect:
+        new_h = int(w / target_aspect)
+        top = (h - new_h) // 2
+        return img.crop((0, top, w, top + new_h))
+    else:
+        new_w = int(h * target_aspect)
+        left = (w - new_w) // 2
+        return img.crop((left, 0, left + new_w, h))
 
 DEFAULT_VOICES = [
     {"provider": "azure", "provider_voice_id": "es-ES-AlvaroNeural", "name": "Álvaro", "gender": "male", "language": "es", "tone": "formal"},
@@ -292,67 +292,70 @@ def _create_slide_image(text: str, shot_type: str, output_path: Path):
 
 
 def _generate_ai_image(prompt_text: str, output_path: Path, max_retries: int = 3):
-    """Genera la imagen con IA absorbiendo colas y picos de latencia en Pollinations."""
-    clean_prompt = re.sub(r"[^\w\s,.\-]", "", prompt_text).strip()[:240]
-    encoded_prompt = urllib.parse.quote(clean_prompt)
-    seed = random.randint(1000, 999999)
+    """Genera la imagen en Cloudflare Workers AI (sin marcas de agua, alta velocidad)."""
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        raise ValueError("Faltan CLOUDFLARE_ACCOUNT_ID o CLOUDFLARE_API_TOKEN en el archivo .env")
 
-    GEN_WIDTH, GEN_HEIGHT = 1280, 720
+    clean_prompt = re.sub(r"[^\w\s,.\-]", "", prompt_text).strip()[:800]
+    endpoint = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID.strip()}/ai/run/{CF_MODEL}"
+
+    body_data = json.dumps({
+        "prompt": clean_prompt,
+        "steps": 4
+    }).encode("utf-8")
+
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN.strip()}",
+        "Content-Type": "application/json",
+        "User-Agent": "FabricaVideos/1.0",
+    }
+
     FINAL_WIDTH, FINAL_HEIGHT = 1920, 1080
-
-    url = (
-        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-        f"?width={GEN_WIDTH}&height={GEN_HEIGHT}&model=turbo"
-        f"&private=true&seed={seed}"
-    )
-
-    if POLLINATIONS_API_KEY:
-        key_clean = POLLINATIONS_API_KEY.strip()
-        url += f"&key={key_clean}&token={key_clean}"
-
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    if POLLINATIONS_API_KEY:
-        headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY.strip()}"
-
-    backoff = 6.0
     last_error: Exception | None = None
 
     for attempt in range(max_retries):
-        _esperar_turno_pollinations()
+        _esperar_turno_cloudflare()
         try:
-            req = urllib.request.Request(url, headers=headers)
-            # Damos 40s para absorber colas temporales en los nodos de inferencia
-            with urllib.request.urlopen(req, timeout=40) as response:
+            req = urllib.request.Request(endpoint, data=body_data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=35) as response:
                 raw_bytes = response.read()
 
-            with Image.open(io.BytesIO(raw_bytes)) as img:
+            image_bytes = raw_bytes
+            try:
+                data = json.loads(raw_bytes.decode("utf-8"))
+                if isinstance(data, dict):
+                    if not data.get("success", True):
+                        errors = data.get("errors", [])
+                        raise ValueError(f"Error en Cloudflare: {errors}")
+                    if "result" in data and "image" in data["result"]:
+                        image_bytes = base64.b64decode(data["result"]["image"])
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+            with Image.open(io.BytesIO(image_bytes)) as img:
                 img.verify()
-            with Image.open(io.BytesIO(raw_bytes)) as img:
-                ancho, alto = img.size
-                if ancho < 256 or alto < 256:
-                    raise ValueError(f"Dimensiones insuficientes ({ancho}x{alto})")
-                imagen_final = img.convert("RGB").resize(
-                    (FINAL_WIDTH, FINAL_HEIGHT), Image.LANCZOS
-                )
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                img_16_9 = _crop_to_16_9(img.convert("RGB"))
+                imagen_final = img_16_9.resize((FINAL_WIDTH, FINAL_HEIGHT), Image.LANCZOS)
                 imagen_final.save(output_path, "PNG")
+
             return
 
         except urllib.error.HTTPError as err:
             last_error = err
+            err_body = err.read().decode("utf-8", errors="ignore")
+            print(f"      [Cloudflare HTTP {err.code}] {err_body[:200]}")
             if err.code == 429 and attempt < max_retries - 1:
-                print(f"      [429 Límite alcanzado] Esperando {backoff}s...")
-                time.sleep(backoff)
-                backoff *= 2
+                time.sleep(4)
                 continue
             if attempt < max_retries - 1:
-                time.sleep(6)
+                time.sleep(2)
                 continue
             raise
         except Exception as exc:
             last_error = exc
             if attempt < max_retries - 1:
-                print(f"      [Aviso red/timeout en intento {attempt + 1}] Pausa de enfriamiento de 12s...")
-                time.sleep(12)  # Pausa suficiente para que el nodo de GPU se desatasque
+                time.sleep(2)
                 continue
             raise
 
@@ -386,7 +389,7 @@ def provision_asset(
             "status": "ready",
             "type": "image",
             "url": f"http://localhost:8000/renders/assets/{filename}",
-            "provider": "pollinations-flux",
+            "provider": "cloudflare-workers-ai",
             "duration_seconds": storyboard_item.get("duration_seconds", 4.0),
             "error_message": None,
         }
