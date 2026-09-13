@@ -292,8 +292,7 @@ def _create_slide_image(text: str, shot_type: str, output_path: Path):
 
 
 def _generate_ai_image(prompt_text: str, output_path: Path, max_retries: int = 3):
-    """Genera la imagen con IA de forma rápida y estable."""
-    # Limpiamos y acotamos el prompt a una longitud segura para la URL
+    """Genera la imagen con IA absorbiendo colas y picos de latencia en Pollinations."""
     clean_prompt = re.sub(r"[^\w\s,.\-]", "", prompt_text).strip()[:240]
     encoded_prompt = urllib.parse.quote(clean_prompt)
     seed = random.randint(1000, 999999)
@@ -301,12 +300,15 @@ def _generate_ai_image(prompt_text: str, output_path: Path, max_retries: int = 3
     GEN_WIDTH, GEN_HEIGHT = 1280, 720
     FINAL_WIDTH, FINAL_HEIGHT = 1920, 1080
 
-    # Usamos model=turbo (o sin parámetro de modelo) y quitamos enhance=true
     url = (
         f"https://image.pollinations.ai/prompt/{encoded_prompt}"
         f"?width={GEN_WIDTH}&height={GEN_HEIGHT}&model=turbo"
-        f"&nologo=true&seed={seed}"
+        f"&private=true&seed={seed}"
     )
+
+    if POLLINATIONS_API_KEY:
+        key_clean = POLLINATIONS_API_KEY.strip()
+        url += f"&key={key_clean}&token={key_clean}"
 
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     if POLLINATIONS_API_KEY:
@@ -319,41 +321,38 @@ def _generate_ai_image(prompt_text: str, output_path: Path, max_retries: int = 3
         _esperar_turno_pollinations()
         try:
             req = urllib.request.Request(url, headers=headers)
-            # Con el modelo turbo, 25 segundos son suficientes para completar la descarga
-            with urllib.request.urlopen(req, timeout=25) as response:
+            # Damos 40s para absorber colas temporales en los nodos de inferencia
+            with urllib.request.urlopen(req, timeout=40) as response:
                 raw_bytes = response.read()
 
-            try:
-                with Image.open(io.BytesIO(raw_bytes)) as img:
-                    img.verify()
-                with Image.open(io.BytesIO(raw_bytes)) as img:
-                    ancho, alto = img.size
-                    if ancho < 256 or alto < 256:
-                        raise ValueError(f"Dimensiones insuficientes ({ancho}x{alto})")
-                    imagen_final = img.convert("RGB").resize(
-                        (FINAL_WIDTH, FINAL_HEIGHT), Image.LANCZOS
-                    )
-                    imagen_final.save(output_path, "PNG")
-            except Exception as err_validacion:
-                raise ValueError(f"Respuesta corrupta o no es imagen: {err_validacion}")
-
-            return  # Descarga exitosa
+            with Image.open(io.BytesIO(raw_bytes)) as img:
+                img.verify()
+            with Image.open(io.BytesIO(raw_bytes)) as img:
+                ancho, alto = img.size
+                if ancho < 256 or alto < 256:
+                    raise ValueError(f"Dimensiones insuficientes ({ancho}x{alto})")
+                imagen_final = img.convert("RGB").resize(
+                    (FINAL_WIDTH, FINAL_HEIGHT), Image.LANCZOS
+                )
+                imagen_final.save(output_path, "PNG")
+            return
 
         except urllib.error.HTTPError as err:
             last_error = err
             if err.code == 429 and attempt < max_retries - 1:
-                print(f"      [429 Límite alcanzado] Esperando {backoff}s antes de reintentar...")
+                print(f"      [429 Límite alcanzado] Esperando {backoff}s...")
                 time.sleep(backoff)
                 backoff *= 2
                 continue
             if attempt < max_retries - 1:
-                time.sleep(3)
+                time.sleep(6)
                 continue
             raise
         except Exception as exc:
             last_error = exc
             if attempt < max_retries - 1:
-                time.sleep(3)
+                print(f"      [Aviso red/timeout en intento {attempt + 1}] Pausa de enfriamiento de 12s...")
+                time.sleep(12)  # Pausa suficiente para que el nodo de GPU se desatasque
                 continue
             raise
 
