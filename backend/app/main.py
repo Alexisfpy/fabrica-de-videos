@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Project
 from app.services.mock_ai import provision_asset
+import random
+from app.models import Asset
 
 Base.metadata.create_all(bind=engine)
 
@@ -51,9 +53,10 @@ def health():
 def read_root():
     return {"status": "ok", "message": "Backend en ejecución"}
 
-router = APIRouter()
+# Definición de la ruta de assets para evitar NameError
+ASSETS_DIR = RENDER_DIR / "assets"
 
-@router.post("/api/projects/{project_id}/shots/{shot_id}/regenerate")
+@app.post("/api/projects/{project_id}/shots/{shot_id}/regenerate")
 def regenerate_single_shot(project_id: str, shot_id: str, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -62,17 +65,25 @@ def regenerate_single_shot(project_id: str, shot_id: str, db: Session = Depends(
     storyboard = project.storyboard or []
     target_shot = next((s for s in storyboard if s.get("id") == shot_id), None)
     if not target_shot:
-        raise HTTPException(status_code=404, detail="Plano no encontrado en el storyboard")
+        raise HTTPException(status_code=404, detail="Plano no encontrado")
 
+    # 1. Eliminar la imagen previa en disco para forzar la llamada a Cloudflare
+    old_file = ASSETS_DIR / f"{project.id}_{shot_id}.png"
+    old_file.unlink(missing_ok=True)
+
+    # 2. Generar nueva imagen
     style = getattr(project, "visual_style", None)
     entities = getattr(project, "entities", None)
-
-    # Forzar nueva generación en Cloudflare y sobreescribir el archivo en disco
     updated_asset = provision_asset(target_shot, project.id, style, entities)
 
-    # Actualizar el estado del asset dentro del storyboard
-    target_shot["asset"] = updated_asset
+    # 3. Actualizar la tabla Asset de SQLAlchemy que lee el frontend
+    db_asset = db.query(Asset).filter(Asset.storyboard_item_id == shot_id).first()
+    if db_asset:
+        db_asset.status = "ready"
+        db_asset.error_message = None
+        db_asset.url = f"http://localhost:8000/renders/assets/{project.id}_{shot_id}.png"
+
     project.storyboard = list(storyboard)
     db.commit()
 
-    return {"status": "ok", "shot": target_shot, "asset": updated_asset}
+    return {"status": "ok", "asset": updated_asset}

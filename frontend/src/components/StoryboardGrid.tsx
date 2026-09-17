@@ -58,7 +58,7 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
   const handleRegenerateShot = async (shotId: string) => {
     setRegeneratingId(shotId)
     try {
-      const res = await fetch(`/api/projects/${projectId}/shots/${shotId}/regenerate`, {
+      const res = await fetch(`http://localhost:8000/api/projects/${projectId}/shots/${shotId}/regenerate`, {
         method: 'POST',
       })
       if (!res.ok) throw new Error('Error al regenerar el plano')
