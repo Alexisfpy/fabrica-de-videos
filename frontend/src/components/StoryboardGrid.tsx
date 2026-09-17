@@ -15,13 +15,16 @@ const SHOT_COLOR: Record<string, string> = {
 }
 
 interface Props {
+  projectId: string
   storyboard: StoryboardItem[]
   assets: Asset[]
   onRetried: () => void
 }
 
-export default function StoryboardGrid({ storyboard, assets, onRetried }: Props) {
+export default function StoryboardGrid({ projectId, storyboard, assets, onRetried }: Props) {
   const [filter, setFilter] = useState<'all' | 'graphic' | 'stock' | 'ai_generated' | 'error'>('all')
+  const [regeneratingId, setRegeneratingId] = useState<string | null>(null)
+  const [cacheBuster, setCacheBuster] = useState<number>(Date.now())
   
   const assetByItem = useMemo(() => {
     const map = new Map<string, Asset>()
@@ -52,6 +55,22 @@ export default function StoryboardGrid({ storyboard, assets, onRetried }: Props)
     setTimeout(onRetried, 900)
   }
 
+  const handleRegenerateShot = async (shotId: string) => {
+    setRegeneratingId(shotId)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/shots/${shotId}/regenerate`, {
+        method: 'POST',
+      })
+      if (!res.ok) throw new Error('Error al regenerar el plano')
+      setCacheBuster(Date.now())
+      onRetried()
+    } catch (err) {
+      console.error(err)
+    } finally {
+      setRegeneratingId(null)
+    }
+  }
+
   return (
     <div>
       {/* Barra de filtros */}
@@ -76,6 +95,7 @@ export default function StoryboardGrid({ storyboard, assets, onRetried }: Props)
         {filtered.map((item) => {
           const asset = assetByItem.get(item.id)
           const isError = asset?.status === 'error' || Boolean(asset?.error_message)
+          const isRegenerating = regeneratingId === item.id
           const errorMsg = asset?.error_message ?? 'Fallo de conexión o límite de peticiones (429)'
 
           return (
@@ -107,23 +127,35 @@ export default function StoryboardGrid({ storyboard, assets, onRetried }: Props)
                   title={isError ? `Motivo del error: ${errorMsg}` : undefined}
                 >
                   <img
-                    src={asset.url}
+                    src={`${asset.url}?t=${cacheBuster}`}
                     alt={item.description}
                     loading="lazy"
-                    className={`w-full h-full object-cover transition-transform duration-200 ${
-                      isError ? 'opacity-65 grayscale-30' : 'group-hover/thumb:scale-105'
+                    className={`w-full h-full object-cover transition-all duration-200 ${
+                      isRegenerating
+                        ? 'opacity-25'
+                        : isError
+                        ? 'opacity-65 grayscale-30'
+                        : 'group-hover/thumb:scale-105'
                     }`}
                   />
 
+                  {/* Indicador de regeneración en curso */}
+                  {isRegenerating && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/50 text-signal font-mono text-xs gap-1.5 z-20">
+                      <span className="w-4 h-4 border-2 border-signal border-t-transparent rounded-full animate-spin" />
+                      <span>generando...</span>
+                    </div>
+                  )}
+
                   {/* Indicador de estado para plano erróneo */}
-                  {isError && (
+                  {isError && !isRegenerating && (
                     <div className="absolute top-1.5 right-1.5 bg-error/90 text-white font-mono text-[10px] uppercase font-bold px-1.5 py-0.5 rounded shadow-md pointer-events-none">
                       Error
                     </div>
                   )}
 
-                  {/* Tooltip superpuesto que aparece al pasar el ratón si falló */}
-                  {isError && (
+                  {/* Tooltip superpuesto al pasar el ratón si falló */}
+                  {isError && !isRegenerating && (
                     <div className="absolute inset-0 bg-black/85 backdrop-blur-[2px] p-3 flex flex-col justify-center items-center text-center opacity-0 group-hover/thumb:opacity-100 transition-opacity duration-150 pointer-events-none z-10">
                       <span className="text-error font-mono text-[11px] font-semibold mb-1">
                         Fallo de generación
@@ -135,7 +167,6 @@ export default function StoryboardGrid({ storyboard, assets, onRetried }: Props)
                   )}
                 </div>
               ) : isError ? (
-                /* Estado en el que hubo error antes de generar URL */
                 <div
                   className="w-full aspect-video rounded-md border border-dashed border-error/60 bg-error/5 flex flex-col items-center justify-center p-3 text-center"
                   title={`Motivo del error: ${errorMsg}`}
@@ -145,27 +176,36 @@ export default function StoryboardGrid({ storyboard, assets, onRetried }: Props)
                 </div>
               ) : null}
 
-              {/* Pie de tarjeta: duración y acción */}
+              {/* Pie de tarjeta: duración, estado y botón de regeneración */}
               <div className="flex items-center justify-between mt-auto pt-1 border-t border-line/40">
                 <span className="font-mono text-xs text-muted">{item.duration_seconds.toFixed(1)}s</span>
-                
-                {!asset && <span className="font-mono text-[11px] text-muted">sin material</span>}
-                
-                {asset && !isError && asset.status === 'ready' && (
-                  <span className="font-mono text-[11px] text-signal font-medium">listo</span>
-                )}
 
-                {isError && (
-                  <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2">
+                  {!asset && <span className="font-mono text-[11px] text-muted">sin material</span>}
+
+                  {asset && !isError && asset.status === 'ready' && (
+                    <span className="font-mono text-[11px] text-signal font-medium">listo</span>
+                  )}
+
+                  {isError && (
                     <button
                       onClick={() => asset?.id && retry(asset.id)}
                       title={`Reintentar generación: ${errorMsg}`}
-                      className="font-mono text-[11px] text-error hover:text-error/80 hover:underline flex items-center gap-1 font-semibold"
+                      className="font-mono text-[11px] text-error hover:text-error/80 hover:underline font-semibold"
                     >
                       reabrir →
                     </button>
-                  </div>
-                )}
+                  )}
+
+                  <button
+                    onClick={() => handleRegenerateShot(item.id)}
+                    disabled={isRegenerating}
+                    className="font-mono text-[11px] text-muted hover:text-signal border border-line rounded px-1.5 py-0.5 disabled:opacity-40 transition"
+                    title="Regenerar esta toma individual con Cloudflare"
+                  >
+                    {isRegenerating ? '...' : '↻ regenerar'}
+                  </button>
+                </div>
               </div>
             </div>
           )

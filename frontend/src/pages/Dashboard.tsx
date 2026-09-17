@@ -89,6 +89,7 @@ function NewProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
   const [format, setFormat] = useState<ProjectFormat>('horizontal_16_9')
   const [minutes, setMinutes] = useState(7)
   const [referenceUrl, setReferenceUrl] = useState('')
+  const [bgmCategory, setBgmCategory] = useState('documental') // <-- NUEVO
   const [submitting, setSubmitting] = useState(false)
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -102,7 +103,8 @@ function NewProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
         format,
         target_duration_seconds: minutes * 60,
         reference_url: referenceUrl || undefined,
-      })
+        bgm_category: bgmCategory, // <-- NUEVO
+      } as any)
       onCreated(project.id)
     } finally {
       setSubmitting(false)
@@ -134,7 +136,8 @@ function NewProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
           className="w-full bg-panel-raised border border-line rounded-md px-3 py-2 outline-none focus:border-signal-dim resize-none"
         />
       </div>
-      <div className="grid sm:grid-cols-3 gap-4">
+      {/* Ajustado a grid de 4 columnas para incluir BGM */}
+      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div>
           <label className="text-xs font-mono text-muted block mb-1">FORMATO</label>
           <select
@@ -160,6 +163,19 @@ function NewProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
             />
             <span className="text-muted text-sm">min</span>
           </div>
+        </div>
+        <div>
+          <label className="text-xs font-mono text-muted block mb-1">MÚSICA (BGM)</label>
+          <select
+            value={bgmCategory}
+            onChange={(e) => setBgmCategory(e.target.value)}
+            className="w-full bg-panel-raised border border-line rounded-md px-3 py-2 outline-none focus:border-signal-dim"
+          >
+            <option value="documental">Documental / Solemne</option>
+            <option value="suspense">Tensión / Misterio</option>
+            <option value="dinamico">Dinámico / Enérgico</option>
+            <option value="none">Sin música de fondo</option>
+          </select>
         </div>
         <div>
           <label className="text-xs font-mono text-muted block mb-1">REFERENCIA (opcional)</label>

@@ -223,29 +223,57 @@ export default function Editor() {
               ))}
             </div>
 
-            {!allProvisioned && (
-              <button
-                onClick={() => run('provision', () => api.provision(project.id))}
-                disabled={busyAction === 'provision' || busy}
-                className="bg-signal text-ink font-medium text-sm px-3 py-1.5 rounded-md disabled:opacity-40 hover:brightness-110 transition"
-              >
-                {busyAction === 'provision' || project.status === 'provisioning'
-                  ? 'Consiguiendo material...'
-                  : 'Conseguir material'}
-              </button>
-            )}
+            {/* Ahora el botón no desaparece: permite regenerar todo si ya están listos */}
+            <button
+              onClick={() => run('provision', () => api.provision(project.id))}
+              disabled={busyAction === 'provision' || busy}
+              className="bg-signal text-ink font-medium text-sm px-3 py-1.5 rounded-md disabled:opacity-40 hover:brightness-110 transition"
+            >
+              {busyAction === 'provision' || project.status === 'provisioning'
+                ? 'Consiguiendo material...'
+                : allProvisioned
+                ? '↻ Regenerar todo'
+                : 'Conseguir material'}
+            </button>
           </div>
 
-          <StoryboardGrid storyboard={project.storyboard ?? []} assets={assets} onRetried={refresh} />
+          < StoryboardGrid projectId={project.id} storyboard={project.storyboard ?? []} assets={assets} onRetried={refresh} />
         </StepCard>
 
         {/* 6. Montaje */}
         <StepCard number={6} title="Montaje" last disabled={!allProvisioned}>
+          <div className="flex items-center gap-3 mb-4 bg-panel-raised border border-line rounded-md p-3">
+            <label className="text-xs font-mono text-muted">BANDA SONORA (BGM):</label>
+            <select
+              value={(project as any).bgm_category || 'documental'}
+              onChange={(e) =>
+                api.updateProject(project.id, { bgm_category: e.target.value } as any).then(refresh)
+              }
+              className="bg-panel border border-line rounded px-2.5 py-1 text-xs font-mono text-paper outline-none focus:border-signal-dim"
+            >
+              <option value="documental">Documental / Solemne</option>
+              <option value="suspense">Tensión / Misterio</option>
+              <option value="dinamico">Dinámico / Enérgico</option>
+              <option value="none">Sin música de fondo</option>
+            </select>
+          </div>
+
           {project.final_video_url ? (
-            <div className="border border-signal-dim rounded-md p-4 bg-panel-raised">
-              <p className="font-mono text-xs text-signal mb-2">vídeo listo</p>
+            <div className="border border-signal-dim rounded-md p-4 bg-panel-raised flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <p className="font-mono text-xs text-signal">vídeo listo</p>
+                <button
+                  onClick={() => run('render', () => api.render(project.id))}
+                  disabled={busyAction === 'render'}
+                  className="font-mono text-xs text-muted hover:text-signal transition"
+                >
+                  {busyAction === 'render' ? 'Montando...' : '↻ Volver a montar vídeo'}
+                </button>
+              </div>
               <a
                 href={project.final_video_url}
+                target="_blank"
+                rel="noreferrer"
                 className="text-sm underline break-all text-paper hover:text-signal"
               >
                 {project.final_video_url}

@@ -605,14 +605,15 @@ def _escapar_ruta_ffmpeg_filtro(path: Path) -> str:
 
 
 def _elegir_pista_bgm(categoria: str | None = None) -> Path | None:
-    if categoria:
+    """Busca en una subcarpeta temática (ej: assets/bgm/documental/). Si no existe o está vacía, busca en la raíz."""
+    if categoria and categoria.lower() != "none":
         subcarpeta = BGM_LIBRARY_DIR / categoria.lower()
         if subcarpeta.exists():
             candidatas = list(subcarpeta.glob("*.mp3")) + list(subcarpeta.glob("*.wav"))
             if candidatas:
                 return random.choice(candidatas)
 
-    # Si no se especifica o la subcarpeta está vacía, busca en toda la biblioteca
+    # Búsqueda global si no hay categoría específica
     todas = list(BGM_LIBRARY_DIR.rglob("*.mp3")) + list(BGM_LIBRARY_DIR.rglob("*.wav"))
     return random.choice(todas) if todas else None
 
@@ -723,7 +724,8 @@ def render_video(project) -> dict:
         raise RuntimeError(f"Fallo al concatenar: {res_concat.stderr}")
 
     # 6) Mix final
-    bgm_path = _elegir_pista_bgm()
+    bgm_category = getattr(project, "bgm_category", None) or "documental"
+    bgm_path = _elegir_pista_bgm(bgm_category)
     inputs = ["-i", str(full_video_temp), "-i", str(audio_path)]
     filter_parts = []
     if tiene_subtitulos and subs_path.exists():

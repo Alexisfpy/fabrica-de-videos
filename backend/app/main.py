@@ -7,6 +7,12 @@ from . import models
 from .database import Base, engine
 from .routers import misc, pipeline, projects
 
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.database import get_db
+from app.models import Project
+from app.services.mock_ai import provision_asset
+
 Base.metadata.create_all(bind=engine)
 
 # Crear las carpetas de salida locales si no existen todavía
@@ -44,3 +50,29 @@ def health():
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "Backend en ejecución"}
+
+router = APIRouter()
+
+@router.post("/api/projects/{project_id}/shots/{shot_id}/regenerate")
+def regenerate_single_shot(project_id: str, shot_id: str, db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+
+    storyboard = project.storyboard or []
+    target_shot = next((s for s in storyboard if s.get("id") == shot_id), None)
+    if not target_shot:
+        raise HTTPException(status_code=404, detail="Plano no encontrado en el storyboard")
+
+    style = getattr(project, "visual_style", None)
+    entities = getattr(project, "entities", None)
+
+    # Forzar nueva generación en Cloudflare y sobreescribir el archivo en disco
+    updated_asset = provision_asset(target_shot, project.id, style, entities)
+
+    # Actualizar el estado del asset dentro del storyboard
+    target_shot["asset"] = updated_asset
+    project.storyboard = list(storyboard)
+    db.commit()
+
+    return {"status": "ok", "shot": target_shot, "asset": updated_asset}
