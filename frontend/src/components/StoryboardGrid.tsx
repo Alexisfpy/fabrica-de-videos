@@ -71,6 +71,26 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
     }
   }
 
+  const handleUploadShot = async (shotId: string, file: File) => {
+    setRegeneratingId(shotId)
+    const formData = new FormData()
+    formData.append('file', file)
+
+    try {
+      const res = await fetch(`http://localhost:8000/api/projects/${projectId}/shots/${shotId}/upload`, {
+        method: 'POST',
+        body: formData,
+      })
+      if (!res.ok) throw new Error('Error al subir la imagen')
+      setCacheBuster(Date.now())
+      onRetried()
+    } catch (err) {
+      console.error('Error al subir imagen:', err)
+    } finally {
+      setRegeneratingId(null)
+    }
+  }
+
   return (
     <div>
       {/* Barra de filtros */}
@@ -139,11 +159,11 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                     }`}
                   />
 
-                  {/* Indicador de regeneración en curso */}
+                  {/* Indicador de proceso en curso */}
                   {isRegenerating && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/50 text-signal font-mono text-xs gap-1.5 z-20">
                       <span className="w-4 h-4 border-2 border-signal border-t-transparent rounded-full animate-spin" />
-                      <span>generando...</span>
+                      <span>procesando...</span>
                     </div>
                   )}
 
@@ -176,7 +196,7 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                 </div>
               ) : null}
 
-              {/* Pie de tarjeta: duración, estado y botón de regeneración */}
+              {/* Pie de tarjeta: duración, estado y botones de acción */}
               <div className="flex items-center justify-between mt-auto pt-1 border-t border-line/40">
                 <span className="font-mono text-xs text-muted">{item.duration_seconds.toFixed(1)}s</span>
 
@@ -197,6 +217,30 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                     </button>
                   )}
 
+                  {/* Botón para subir archivo local */}
+                  <label
+                    className={`font-mono text-[11px] text-muted hover:text-signal border border-line rounded px-1.5 py-0.5 cursor-pointer hover:border-signal-dim transition ${
+                      isRegenerating ? 'opacity-40 pointer-events-none' : ''
+                    }`}
+                    title="Subir imagen desde tu ordenador"
+                  >
+                    ↑ subir
+                    <input
+                      type="file"
+                      accept="image/png, image/jpeg, image/webp"
+                      className="hidden"
+                      disabled={isRegenerating}
+                      onChange={(e) => {
+                        const file = e.target.files?.[0]
+                        if (file) {
+                          handleUploadShot(item.id, file)
+                          e.target.value = ''
+                        }
+                      }}
+                    />
+                  </label>
+
+                  {/* Botón para regenerar con IA */}
                   <button
                     onClick={() => handleRegenerateShot(item.id)}
                     disabled={isRegenerating}

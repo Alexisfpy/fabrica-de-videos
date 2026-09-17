@@ -3,7 +3,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from . import models
 from .database import Base, engine
 from .routers import misc, pipeline, projects
 
@@ -12,8 +11,11 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Project
 from app.services.mock_ai import provision_asset
-import random
+
 from app.models import Asset
+
+import shutil
+from fastapi import UploadFile, File
 
 Base.metadata.create_all(bind=engine)
 
@@ -87,3 +89,39 @@ def regenerate_single_shot(project_id: str, shot_id: str, db: Session = Depends(
     db.commit()
 
     return {"status": "ok", "asset": updated_asset}
+
+@app.post("/api/projects/{project_id}/shots/{shot_id}/upload")
+async def upload_single_shot(
+    project_id: str, 
+    shot_id: str, 
+    file: UploadFile = File(...), 
+    db: Session = Depends(get_db)
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+
+    storyboard = project.storyboard or []
+    target_shot = next((s for s in storyboard if s.get("id") == shot_id), None)
+    if not target_shot:
+        raise HTTPException(status_code=404, detail="Plano no encontrado")
+
+    # Sobrescribir directamente el archivo .png del asset
+    dest_path = ASSETS_DIR / f"{project.id}_{shot_id}.png"
+    with dest_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Actualizar el registro en la base de datos
+    db_asset = db.query(Asset).filter(Asset.storyboard_item_id == shot_id).first()
+    if db_asset:
+        db_asset.status = "ready"
+        db_asset.error_message = None
+        db_asset.url = f"http://localhost:8000/renders/assets/{project.id}_{shot_id}.png"
+
+    project.storyboard = list(storyboard)
+    db.commit()
+
+    return {
+        "status": "ok", 
+        "url": f"http://localhost:8000/renders/assets/{project.id}_{shot_id}.png"
+    }
