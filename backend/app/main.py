@@ -16,6 +16,8 @@ from app.models import Asset
 
 import shutil
 from fastapi import UploadFile, File
+from pydantic import BaseModel
+from sqlalchemy.orm.attributes import flag_modified
 
 Base.metadata.create_all(bind=engine)
 
@@ -125,3 +127,48 @@ async def upload_single_shot(
         "status": "ok", 
         "url": f"http://localhost:8000/renders/assets/{project.id}_{shot_id}.png"
     }
+
+
+class FocusPayload(BaseModel):
+    focus_x: int = 50  # 0% (izquierda) a 100% (derecha)
+    focus_y: int = 50  # 0% (arriba) a 100% (abajo)
+
+@app.patch("/api/projects/{project_id}/shots/{shot_id}/focus")
+def update_shot_focus(
+    project_id: str, 
+    shot_id: str, 
+    payload: FocusPayload, 
+    db: Session = Depends(get_db)
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+
+    storyboard = project.storyboard or []
+    for shot in storyboard:
+        if shot.get("id") == shot_id:
+            shot["focus_x"] = payload.focus_x
+            shot["focus_y"] = payload.focus_y
+            break
+
+    project.storyboard = list(storyboard)
+    db.commit()
+    return {"status": "ok"}
+
+@app.patch("/api/projects/{project_id}/shots/{shot_id}/focus")
+def update_shot_focus(project_id: str, shot_id: str, payload: FocusPayload, db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+
+    storyboard = project.storyboard or []
+    for shot in storyboard:
+        if shot.get("id") == shot_id:
+            shot["focus_x"] = payload.focus_x
+            shot["focus_y"] = payload.focus_y
+            break
+
+    project.storyboard = list(storyboard)
+    flag_modified(project, "storyboard")  # <-- OBLIGATORIO para guardar campos JSON en SQLAlchemy
+    db.commit()
+    return {"status": "ok"}

@@ -25,7 +25,8 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
   const [filter, setFilter] = useState<'all' | 'graphic' | 'stock' | 'ai_generated' | 'error'>('all')
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null)
   const [cacheBuster, setCacheBuster] = useState<number>(Date.now())
-  
+  const [focusOverrides, setFocusOverrides] = useState<Record<string, { x: number; y: number }>>({})
+
   const assetByItem = useMemo(() => {
     const map = new Map<string, Asset>()
     assets.forEach((a) => map.set(a.storyboard_item_id, a))
@@ -91,6 +92,22 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
     }
   }
 
+  const handleUpdateFocus = async (shotId: string, focusX: number, focusY: number) => {
+    setFocusOverrides((prev) => ({ ...prev, [shotId]: { x: focusX, y: focusY } }))
+
+    try {
+      const res = await fetch(`http://localhost:8000/api/projects/${projectId}/shots/${shotId}/focus`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ focus_x: focusX, focus_y: focusY }),
+      })
+      if (!res.ok) throw new Error('Error al actualizar el foco')
+      onRetried()
+    } catch (err) {
+      console.error('Error actualizando posición:', err)
+    }
+  }
+
   return (
     <div>
       {/* Barra de filtros */}
@@ -117,6 +134,9 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
           const isError = asset?.status === 'error' || Boolean(asset?.error_message)
           const isRegenerating = regeneratingId === item.id
           const errorMsg = asset?.error_message ?? 'Fallo de conexión o límite de peticiones (429)'
+          
+          const focusX = focusOverrides[item.id]?.x ?? (item as any).focus_x ?? 50
+          const focusY = focusOverrides[item.id]?.y ?? (item as any).focus_y ?? 50
 
           return (
             <div
@@ -150,12 +170,16 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                     src={`${asset.url}?t=${cacheBuster}`}
                     alt={item.description}
                     loading="lazy"
-                    className={`w-full h-full object-cover transition-all duration-200 ${
+                    style={{
+                      objectPosition: `${focusX}% ${focusY}%`,
+                      transformOrigin: `${focusX}% ${focusY}%`,
+                    }}
+                    className={`w-full h-full object-cover scale-125 transition-all duration-300 ${
                       isRegenerating
                         ? 'opacity-25'
                         : isError
                         ? 'opacity-65 grayscale-30'
-                        : 'group-hover/thumb:scale-105'
+                        : ''
                     }`}
                   />
 
@@ -200,11 +224,11 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
               <div className="flex items-center justify-between mt-auto pt-1 border-t border-line/40">
                 <span className="font-mono text-xs text-muted">{item.duration_seconds.toFixed(1)}s</span>
 
-                <div className="flex items-center gap-2">
-                  {!asset && <span className="font-mono text-[11px] text-muted">sin material</span>}
+                <div className="flex items-center gap-1.5">
+                  {!asset && <span className="font-mono text-[11px] text-muted mr-1">sin material</span>}
 
                   {asset && !isError && asset.status === 'ready' && (
-                    <span className="font-mono text-[11px] text-signal font-medium">listo</span>
+                    <span className="font-mono text-[11px] text-signal font-medium mr-1">listo</span>
                   )}
 
                   {isError && (
@@ -215,6 +239,30 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                     >
                       reabrir →
                     </button>
+                  )}
+
+                  {/* Selector rápido de encuadre */}
+                  {asset?.url && (
+                    <select
+                      value={`${focusX}-${focusY}`}
+                      onChange={(e) => {
+                        const [x, y] = e.target.value.split('-').map(Number)
+                        handleUpdateFocus(item.id, x, y)
+                      }}
+                      disabled={isRegenerating}
+                      className="bg-panel border border-line rounded px-1 py-0.5 font-mono text-[10px] text-muted outline-none hover:border-signal-dim transition"
+                      title="Alinear encuadre visual"
+                    >
+                      <option value="50-50">Centro</option>
+                      <option value="50-0">Arriba</option>
+                      <option value="50-100">Abajo</option>
+                      <option value="0-50">Izquierda</option>
+                      <option value="100-50">Derecha</option>
+                      <option value="0-0">Arriba-Izquierda</option>
+                      <option value="100-0">Arriba-Derecha</option>
+                      <option value="0-100">Abajo-Izquierda</option>
+                      <option value="100-100">Abajo-Derecha</option>
+                    </select>
                   )}
 
                   {/* Botón para subir archivo local */}
