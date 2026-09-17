@@ -604,9 +604,17 @@ def _escapar_ruta_ffmpeg_filtro(path: Path) -> str:
     return path.resolve().as_posix().replace(":", "\\:")
 
 
-def _elegir_pista_bgm() -> Path | None:
-    candidatas = list(BGM_LIBRARY_DIR.glob("*.mp3")) + list(BGM_LIBRARY_DIR.glob("*.wav"))
-    return random.choice(candidatas) if candidatas else None
+def _elegir_pista_bgm(categoria: str | None = None) -> Path | None:
+    if categoria:
+        subcarpeta = BGM_LIBRARY_DIR / categoria.lower()
+        if subcarpeta.exists():
+            candidatas = list(subcarpeta.glob("*.mp3")) + list(subcarpeta.glob("*.wav"))
+            if candidatas:
+                return random.choice(candidatas)
+
+    # Si no se especifica o la subcarpeta está vacía, busca en toda la biblioteca
+    todas = list(BGM_LIBRARY_DIR.rglob("*.mp3")) + list(BGM_LIBRARY_DIR.rglob("*.wav"))
+    return random.choice(todas) if todas else None
 
 
 def _get_audio_duration(audio_path: Path) -> float:
