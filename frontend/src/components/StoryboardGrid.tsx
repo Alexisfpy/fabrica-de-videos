@@ -141,7 +141,7 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
           return (
             <div
               key={item.id}
-              className={`border rounded-lg p-3 bg-panel-raised flex flex-col gap-2.5 transition-colors ${
+              className={`border rounded-lg p-3 bg-panel-raised flex flex-col gap-2.5 transition-colors overflow-hidden ${
                 isError ? 'border-error/70 shadow-sm shadow-error/10' : 'border-line'
               }`}
             >
@@ -198,7 +198,7 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                     </div>
                   )}
 
-                  {/* Tooltip superpuesto al pasar el ratón si falló */}
+                  {/* Tooltip con motivo de error */}
                   {isError && !isRegenerating && (
                     <div className="absolute inset-0 bg-black/85 backdrop-blur-[2px] p-3 flex flex-col justify-center items-center text-center opacity-0 group-hover/thumb:opacity-100 transition-opacity duration-150 pointer-events-none z-10">
                       <span className="text-error font-mono text-[11px] font-semibold mb-1">
@@ -220,28 +220,38 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                 </div>
               ) : null}
 
-              {/* Pie de tarjeta: duración, estado y botones de acción */}
-              <div className="flex items-center justify-between mt-auto pt-1 border-t border-line/40">
-                <span className="font-mono text-xs text-muted">{item.duration_seconds.toFixed(1)}s</span>
+              {/* Pie de tarjeta en 2 niveles alineados */}
+              <div className="mt-auto pt-2 border-t border-line/40 flex flex-col gap-2">
+                {/* Nivel 1: Métricas y selector en una sola línea fija */}
+                <div className="flex items-center justify-between gap-2 min-h-[24px]">
+                  <div className="flex items-center gap-2 font-mono text-xs text-muted whitespace-nowrap overflow-hidden">
+                    <span>{item.duration_seconds.toFixed(1)}s</span>
 
-                <div className="flex items-center gap-1.5">
-                  {!asset && <span className="font-mono text-[11px] text-muted mr-1">sin material</span>}
+                    {!asset && (
+                      <span className="inline-flex items-center gap-1 text-[11px] text-muted">
+                        <span className="w-1.5 h-1.5 rounded-full bg-muted/50 shrink-0" />
+                        sin material
+                      </span>
+                    )}
 
-                  {asset && !isError && asset.status === 'ready' && (
-                    <span className="font-mono text-[11px] text-signal font-medium mr-1">listo</span>
-                  )}
+                    {asset && !isError && asset.status === 'ready' && (
+                      <span className="inline-flex items-center gap-1 text-[11px] text-signal font-medium">
+                        <span className="w-1.5 h-1.5 rounded-full bg-signal shrink-0" />
+                        listo
+                      </span>
+                    )}
 
-                  {isError && (
-                    <button
-                      onClick={() => asset?.id && retry(asset.id)}
-                      title={`Reintentar generación: ${errorMsg}`}
-                      className="font-mono text-[11px] text-error hover:text-error/80 hover:underline font-semibold"
-                    >
-                      reabrir →
-                    </button>
-                  )}
+                    {isError && (
+                      <button
+                        onClick={() => asset?.id && retry(asset.id)}
+                        className="inline-flex items-center gap-1 text-[11px] text-error hover:underline font-semibold"
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full bg-error shrink-0" />
+                        reabrir →
+                      </button>
+                    )}
+                  </div>
 
-                  {/* Selector rápido de encuadre */}
                   {asset?.url && (
                     <select
                       value={`${focusX}-${focusY}`}
@@ -250,7 +260,7 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                         handleUpdateFocus(item.id, x, y)
                       }}
                       disabled={isRegenerating}
-                      className="bg-panel border border-line rounded px-1 py-0.5 font-mono text-[10px] text-muted outline-none hover:border-signal-dim transition"
+                      className="bg-panel border border-line rounded px-1.5 py-0.5 font-mono text-[10px] text-muted outline-none hover:border-signal-dim transition cursor-pointer shrink-0 max-w-[105px]"
                       title="Alinear encuadre visual"
                     >
                       <option value="50-50">Centro</option>
@@ -258,16 +268,18 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                       <option value="50-100">Abajo</option>
                       <option value="0-50">Izquierda</option>
                       <option value="100-50">Derecha</option>
-                      <option value="0-0">Arriba-Izquierda</option>
-                      <option value="100-0">Arriba-Derecha</option>
-                      <option value="0-100">Abajo-Izquierda</option>
-                      <option value="100-100">Abajo-Derecha</option>
+                      <option value="0-0">Arr-Izq</option>
+                      <option value="100-0">Arr-Der</option>
+                      <option value="0-100">Abj-Izq</option>
+                      <option value="100-100">Abj-Der</option>
                     </select>
                   )}
+                </div>
 
-                  {/* Botón para subir archivo local */}
+                {/* Nivel 2: Botones simétricos ocupando todo el ancho */}
+                <div className="grid grid-cols-2 gap-2">
                   <label
-                    className={`font-mono text-[11px] text-muted hover:text-signal border border-line rounded px-1.5 py-0.5 cursor-pointer hover:border-signal-dim transition ${
+                    className={`font-mono text-[11px] text-center text-muted hover:text-signal border border-line rounded py-1 cursor-pointer hover:border-signal-dim transition ${
                       isRegenerating ? 'opacity-40 pointer-events-none' : ''
                     }`}
                     title="Subir imagen desde tu ordenador"
@@ -288,11 +300,10 @@ export default function StoryboardGrid({ projectId, storyboard, assets, onRetrie
                     />
                   </label>
 
-                  {/* Botón para regenerar con IA */}
                   <button
                     onClick={() => handleRegenerateShot(item.id)}
                     disabled={isRegenerating}
-                    className="font-mono text-[11px] text-muted hover:text-signal border border-line rounded px-1.5 py-0.5 disabled:opacity-40 transition"
+                    className="font-mono text-[11px] text-center text-muted hover:text-signal border border-line rounded py-1 disabled:opacity-40 hover:border-signal-dim transition"
                     title="Regenerar esta toma individual con Cloudflare"
                   >
                     {isRegenerating ? '...' : '↻ regenerar'}

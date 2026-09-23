@@ -124,16 +124,24 @@ def analyze_reference(reference_url: str) -> dict:
 def generate_script(title: str, description: str, target_duration_seconds: int, reference_analysis: dict | None) -> list[dict]:
     style_guide = ""
     if reference_analysis:
-        style_guide = f"Toma como referencia un ritmo de corte promedio de {reference_analysis.get('avg_shot_seconds', 4)}s."
+        style_guide = f"Toma como referencia un ritmo de corte promedio de {reference_analysis.get('avg_shot_seconds', 3.5)}s."
+        
     prompt = f"""
-    Eres un guionista profesional para vídeos dinámicos.
+    Eres un guionista y editor de contenido viral de alto impacto (documental/ensayo visual).
     Tema: {title}
-    Detalles: {description}
+    Detalles clave: {description}
     Duración objetivo total: {target_duration_seconds} segundos.
     {style_guide}
+
+    REGLAS EDITORIALES ESTRICTAS (Anti-contenido repetitivo):
+    1. HOOK INICIAL (0-5s): Prohibido abrir con saludos, presentaciones o introducciones vacías ("Hoy hablaremos...", "El tema de..."). Empieza en mitad del clímax, con una cifra perturbadora, una ironía o una paradoja.
+    2. PATTERN INTERRUPTS: Cada bloque narrativo debe durar entre 8 y 16 segundos máximo y terminar con una frase que impulse al espectador al siguiente punto.
+    3. TONO: Ritmo ágil, periodismo de investigación, verbos directos en presente activo, sin adjetivos genéricos ("increíble", "asombroso").
+    4. ESTRUCTURA: Conflicto inicial -> Revelación de datos poco conocidos -> Consecuencias reales -> Conclusión con punto de vista contundente.
+
     Divide el guion en bloques cronológicos para la voz en off.
     Responde ÚNICAMENTE con un JSON válido:
-    {{"blocks": [{{"id": "b1", "order": 1, "text": "...", "estimated_seconds": 15.0}}]}}
+    {{"blocks": [{{"id": "b1", "order": 1, "text": "...", "estimated_seconds": 12.0}}]}}
     """
     response = _call_gemini_with_retry(prompt)
     data = _parse_json_safely(response.text)
@@ -173,12 +181,12 @@ def generate_storyboard(script: list[dict],
     Guía de entidades: {json.dumps(entidades, ensure_ascii=False)}
     Guion: {json.dumps(script, ensure_ascii=False)}
 
-    REGLAS ESTRICTAS DE 'prompt_en':
-    1. Rostros: PRIORIZA planos medios o primeros planos. Profundidad de campo reducida.
-    2. Cada 'prompt_en' DEBE terminar con: ", 8k resolution, crisp details, sharp focus, high texture detail, cinematic photography, 35mm film aesthetics"
-    3. Sustituye entidades por sus rasgos físicos.
+    REGLAS EDITORIALES DE EDICIÓN:
+    1. DURACIÓN: Cada plano DEBE durar entre 2.0 y 3.5 segundos máximo. Divide los bloques de texto largos en varios planos complementarios (ej. plano general del contexto -> macro detalle del objeto/rostro).
+    2. VARIEDAD DE ENCUADRE: Alterna constantemente entre 'extreme close-up', 'medium shot', 'low angle dramatic shot' y 'wide panoramic shot'.
+    3. PROMPT EN: Termina siempre con: ", 8k resolution, crisp details, sharp focus, high texture detail, cinematic photography, 35mm film aesthetics".
 
-    Para cada plano: id, order, description, prompt_en, shot_type, source, duration_seconds.
+    Devuelve para cada plano: id, order, description, prompt_en, shot_type, source, duration_seconds.
     Responde ÚNICAMENTE con: {{"storyboard": [...]}}
     """
     response = _call_gemini_with_retry(prompt)
@@ -337,17 +345,38 @@ KENBURNS_UPSCALE_LONG_EDGE = 6000   # antes 2560 → ESTA es la clave del arregl
 
 def _build_kenburns_segment(img_path: Path, seg_path: Path, duration: float,
                             target_w: int, target_h: int, is_vertical: bool,
-                            shot_index: int) -> list[str]:
+                            shot_index: int, focus_x: int = 50, focus_y: int = 50) -> list[str]:
     total_frames = max(int(round(duration * KENBURNS_FPS)), 1)
-    zoom_delta = (KENBURNS_ZOOM_END - KENBURNS_ZOOM_START) / max(total_frames, 1)
+    
+    # Coordenadas relativas del punto de enfoque (0.0 a 1.0)
+    fx = max(0.0, min(1.0, focus_x / 100.0))
+    fy = max(0.0, min(1.0, focus_y / 100.0))
 
-    # Acumulador: arranca en 1.0 (valor por defecto de zoompan) y sube lineal.
-    z_expr = f"min(zoom+{zoom_delta:.8f},{KENBURNS_ZOOM_END})"
-    x_expr = "iw/2-(iw/zoom/2)"
-    y_expr = "ih/2-(ih/zoom/2)"
+    # Paso de zoom adaptado a la duración exacta del plano
+    zoom_step = 0.08 / max(total_frames, 1)
+
+    # Alternar patrones de cámara según el plano (i % 3)
+    movimiento = shot_index % 3
+
+    if movimiento == 0:
+        # Modo 0: Zoom In progresivo hacia el foco durante toda la toma
+        z_expr = f"min(zoom+{zoom_step:.8f}, 1.08)"
+        x_expr = f"(iw-iw/zoom)*{fx:.4f}"
+        y_expr = f"(ih-ih/zoom)*{fy:.4f}"
+    elif movimiento == 1:
+        # Modo 1: Zoom Out continuo revelando la escena
+        z_expr = f"max(1.08-{zoom_step:.8f}*on, 1.0)"
+        x_expr = f"(iw-iw/zoom)*{fx:.4f}"
+        y_expr = f"(ih-ih/zoom)*{fy:.4f}"
+    else:
+        # Modo 2: Paneo lateral continuo sin riesgo de desbordar márgenes
+        z_expr = "1.08"
+        pan_rango = 0.12  # Recorrido del desplazamiento (12% del margen)
+        pan_inicio = max(0.0, min(1.0 - pan_rango, fx - (pan_rango / 2.0)))
+        x_expr = f"(iw-iw/zoom)*({pan_inicio:.4f} + (on/{total_frames})*{pan_rango:.4f})"
+        y_expr = f"(ih-ih/zoom)*{fy:.4f}"
 
     if is_vertical:
-        # 9:16 → fondo desenfocado (zoom suave) + plano 16:9 nítido centrado.
         fg_h = int(round(target_w * 9 / 16))
         kb_bg = (f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
                  f"d={total_frames}:s={target_w}x{target_h}:fps={KENBURNS_FPS}")
@@ -431,8 +460,10 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
         chunk_files.append(chunk_path)
         boundaries: list[dict] = []
 
+        # Limpieza de signos para modular respiración
+        chunk_limpio = chunk.replace("...", " — ").replace(" - ", ", ")
         try:
-            communicate = edge_tts.Communicate(chunk, voice, boundary="WordBoundary")
+            communicate = edge_tts.Communicate(chunk_limpio, voice, rate="+6%",pitch="+0Hz", boundary="WordBoundary")
             with open(chunk_path, "wb") as f:
                 async for piece in communicate.stream():
                     # Acceso robusto: funciona con dicts y con objetos en distintas
@@ -696,8 +727,12 @@ def render_video(project) -> dict:
         img_path = ASSETS_DIR / f"{project.id}_{shot['id']}.png"
         if not img_path.exists():
             _create_slide_image(shot.get("description", "Escena"), "graphic", img_path)
+            
+        focus_x = int(shot.get("focus_x", 50))
+        focus_y = int(shot.get("focus_y", 50))
+        
         seg_path = RENDERS_DIR / f"{project.id}_seg_{i}.mp4"
-        cmd = _build_kenburns_segment(img_path, seg_path, duration, target_w, target_h, is_vertical, i)
+        cmd = _build_kenburns_segment(img_path, seg_path, duration, target_w, target_h, is_vertical, i, focus_x, focus_y)
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             raise RuntimeError(f"Fallo de FFmpeg en el plano {shot['id']}: {res.stderr}")
