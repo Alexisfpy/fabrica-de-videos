@@ -73,10 +73,10 @@ DEFAULT_VOICES = [
 ]
 
 
-def _call_gemini_with_retry(prompt: str, max_retries: int = 5, json_mode: bool = True):
+def _call_gemini_with_retry(prompt: str, max_retries: int = 7, json_mode: bool = True):
     if not gemini_client:
         raise ValueError("GEMINI_API_KEY no está configurada en el archivo .env")
-    delay = 3.0
+    delay = 5.0  # Antes 3.0: da más margen en los primeros reintentos
     config = types.GenerateContentConfig(response_mime_type="application/json") if json_mode else None
     for attempt in range(max_retries):
         try:
@@ -91,8 +91,8 @@ def _call_gemini_with_retry(prompt: str, max_retries: int = 5, json_mode: bool =
                     print(f"[Gemini 429] Cuota alcanzada. Esperando {wait_time:.1f}s...")
                 else:
                     wait_time = delay
-                    delay *= 2
-                    print(f"[Gemini Espera] Reintento {attempt + 1}/{max_retries}. Esperando {wait_time}s...")
+                    delay *= 1.8
+                    print(f"[Gemini Espera] Reintento {attempt + 1}/{max_retries} (503/429). Esperando {wait_time:.1f}s...")
                 time.sleep(wait_time)
                 continue
             raise e
@@ -494,6 +494,12 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
             # Asegura que al menos hay un MP3 (aunque vacío) para no romper el concat.
             chunk_path.touch(exist_ok=True)
 
+        # Inyectar puntuación y mayúsculas originales sobre las marcas de tiempo
+        palabras_orig = [w for w in chunk_limpio.split() if any(c.isalnum() for c in w)]
+        if len(palabras_orig) == len(boundaries):
+            for b, orig_w in zip(boundaries, palabras_orig):
+                b["text"] = orig_w
+
         dur = _get_audio_duration(chunk_path)
         chunk_boundaries.append(boundaries)
         chunk_durations.append(dur)
@@ -584,27 +590,61 @@ def _formatear_tiempo_ass(segundos: float) -> str:
 
 
 def _generar_subtitulos_ass(palabras: list[dict], output_path: Path,
-                            max_palabras_por_cue: int = 5, max_segundos_por_cue: float = 2.5,
+                            max_palabras_por_cue: int = 4, max_segundos_por_cue: float = 2.2,
                             resolution: tuple[int, int] = (1920, 1080), is_vertical: bool = False) -> bool:
     if not palabras:
         return False
+        
     res_w, res_h = resolution
-    font_size = 54 if is_vertical else 42
-    margen_v = int(res_h * 0.18) if is_vertical else int(res_h * 0.10)
+    
+    # 1. Aumento de tamaño (+24%): 42 -> 52 en horizontal, 54 -> 64 en vertical
+    font_size = 64 if is_vertical else 52
+    margen_v = int(res_h * 0.18) if is_vertical else int(res_h * 0.11)
 
     cues: list[dict] = []
     actual: list[dict] = []
 
     def _cerrar_cue():
         if actual:
-            cues.append({"start": actual[0]["start"], "end": actual[-1]["end"],
-                         "text": " ".join(p["text"] for p in actual)})
+            cues.append({
+                "start": actual[0]["start"],
+                "end": actual[-1]["end"],
+                "text": " ".join(p["text"] for p in actual).strip()
+            })
+
+    PUNTUACION_TERMINAL = {".", "!", "?", ":", ";", "—"}
 
     for palabra in palabras:
-        if actual and (len(actual) >= max_palabras_por_cue
-                       or (palabra["end"] - actual[0]["start"]) > max_segundos_por_cue):
-            _cerrar_cue(); actual = []
+        texto = palabra.get("text", "").strip()
+        if not texto:
+            continue
+
+        if actual:
+            prev_text = actual[-1].get("text", "").strip()
+            prev_end = actual[-1].get("end", 0.0)
+            curr_start = palabra.get("start", 0.0)
+            curr_end = palabra.get("end", curr_start)
+            gap = curr_start - prev_end
+
+            # A. ¿La palabra anterior cerraba una frase? (. ? ! : ;)
+            termina_oracion = any(prev_text.endswith(p) for p in PUNTUACION_TERMINAL)
+
+            # B. ¿Pausa de respiración/silencio entre oraciones (> 0.25s)?
+            pausa_notable = gap > 0.25
+
+            # C. ¿La nueva palabra empieza con mayúscula y ya hay palabras en pantalla?
+            es_mayuscula = (texto[0].isupper() and len(actual) >= 2 and not prev_text.endswith(","))
+
+            # D. Límites de lectura (máximo 4 palabras para no saturar en pantalla móvil)
+            limite_palabras = len(actual) >= max_palabras_por_cue
+            limite_tiempo = (curr_end - actual[0]["start"]) > max_segundos_por_cue
+
+            if termina_oracion or pausa_notable or es_mayuscula or limite_palabras or limite_tiempo:
+                _cerrar_cue()
+                actual = []
+
         actual.append(palabra)
+
     _cerrar_cue()
 
     header = f"""[Script Info]
@@ -615,7 +655,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3.5,1.5,2,30,30,{margen_v},1
+Style: Default,Arial,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3.8,1.5,2,30,30,{margen_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -626,6 +666,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if not texto:
             continue
         lineas.append(f"Dialogue: 0,{_formatear_tiempo_ass(cue['start'])},{_formatear_tiempo_ass(cue['end'])},Default,,0,0,0,,{texto}")
+        
     output_path.write_text(header + "\n".join(lineas) + "\n", encoding="utf-8")
     print(f"[Subtítulos] Archivo .ass generado: {output_path.name}")
     return True
