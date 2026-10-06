@@ -76,15 +76,22 @@ DEFAULT_VOICES = [
 def _call_gemini_with_retry(prompt: str, max_retries: int = 7, json_mode: bool = True):
     if not gemini_client:
         raise ValueError("GEMINI_API_KEY no está configurada en el archivo .env")
-    delay = 5.0  # Antes 3.0: da más margen en los primeros reintentos
+    delay = 5.0
     config = types.GenerateContentConfig(response_mime_type="application/json") if json_mode else None
+    model_to_use = VISION_MODEL
+
     for attempt in range(max_retries):
         try:
-            return gemini_client.models.generate_content(model=VISION_MODEL, contents=prompt, config=config)
+            return gemini_client.models.generate_content(model=model_to_use, contents=prompt, config=config)
         except Exception as e:
             err_msg = str(e)
             is_transient = any(code in err_msg for code in ["503", "429", "UNAVAILABLE", "high demand", "ResourceExhausted"])
             if is_transient and attempt < max_retries - 1:
+                # Fallback automático si gemini-3.6-flash está saturado
+                if ("503" in err_msg or "high demand" in err_msg) and attempt >= 2 and model_to_use == VISION_MODEL:
+                    print("[Gemini 503] Alta demanda persistente. Cambiando temporalmente a modelo de respaldo (gemini-2.0-flash)...")
+                    model_to_use = "gemini-2.0-flash"
+
                 match = re.search(r"retry in ([\d\.]+)s", err_msg, re.IGNORECASE)
                 if match:
                     wait_time = float(match.group(1)) + 2.0
@@ -121,6 +128,35 @@ def analyze_reference(reference_url: str) -> dict:
     return _parse_json_safely(response.text)
 
 
+def limpiar_texto_locucion(texto: str) -> str:
+    """
+    Elimina cualquier acotación de dirección, notas de cámara, corchetes,
+    paréntesis técnicos o menciones a B-roll antes de enviar a Edge-TTS.
+    Garantiza que al narrador solo llegue texto conversacional puro.
+    """
+    if not texto:
+        return ""
+
+    # 1. Eliminar contenido entre corchetes o paréntesis: [Plano detalle], (Voz en off), [Corte]
+    t = re.sub(r"\[.*?\]", " ", texto)
+    t = re.sub(r"\(.*?\)", " ", t)
+
+    # 2. Eliminar prefijos técnicos habituales de guion
+    patrones_tecnicos = [
+        r"(?i)\b(b-roll|b_roll|broll)\b\s*:?",
+        r"(?i)\b(primerísimo\s+primer\s+plano|primer\s+plano|plano\s+[a-zá-ú]+|toma\s+[a-zá-ú]+|cámara\s+[a-zá-ú]+)\s*:?",
+        r"(?i)\b(corte\s+a|transición|zoom\s+in|zoom\s+out|paneo)\b\s*:?",
+        r"(?i)\b(pantalla\s+dividida|infografía|gráfico\s+en\s+pantalla)\b\s*:?",
+        r"(?i)\b(un\s+especialista\s+analiza.*?cámara|el\s+macro\s+revela.*?|observa\s+la\s+contracción.*?)\b\s*:?",
+    ]
+    for patron in patrones_tecnicos:
+        t = re.sub(patron, " ", t)
+
+    # 3. Limpiar dobles espacios y saltos de línea sobrantes
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def generate_script(title: str, description: str, target_duration_seconds: int, reference_analysis: dict | None) -> list[dict]:
     style_guide = ""
     if reference_analysis:
@@ -129,24 +165,32 @@ def generate_script(title: str, description: str, target_duration_seconds: int, 
     # A 145 palabras por minuto (+6% de velocidad en Álvaro):
     # Para 10 minutos (600s) = ~1.450 palabras. Para 8 minutos (480s) = ~1.160 palabras.
     min_palabras = int((target_duration_seconds / 60) * 145)
-
+    # CAMBIAR AQUI LA FILOSOFÍA
     prompt = f"""
-    Eres un guionista y editor de contenido viral de alto impacto (documental/ensayo visual).
+    Eres el guionista principal de un canal de divulgación y ensayos visuales de alto rigor técnico.
     Tema: {title}
     Detalles clave: {description}
     Duración objetivo total: {target_duration_seconds} segundos.
     {style_guide}
 
-    REGLAS EDITORIALES ESTRICTAS:
-    1. EXTENSIÓN OBLIGATORIA: El guion COMPLETO debe tener como MÍNIMO {min_palabras} palabras reales narradas en total. No resumas; desarrolla en profundidad cada dato técnico, consecuencias y ejemplos.
-    2. HOOK INICIAL (0-5s): Prohibido abrir con saludos o introducciones vacías. Empieza en mitad del clímax con una cifra perturbadora.
-    3. LONGITUD POR BLOQUE: Cada bloque debe tener entre 25 y 40 palabras de locución continua.
-    4. TONO: Ritmo ágil, periodismo de investigación, verbos directos en presente activo, sin adjetivos genéricos.
-    5. ESTRUCTURA: Conflicto inicial -> Revelación de datos poco conocidos -> Consecuencias reales -> Conclusión con punto de vista contundente.
+    FILOSOFÍA Y FIRMA DEL CANAL ("CUELLO DE BOTELLA"):
+    1. Debes articular las explicaciones utilizando el concepto de 'cuello de botella' como marco analítico recurrente.
+       - En tecnología/energía: 'La red eléctrica es el verdadero cuello de botella de la computación'; 'La disipación térmica por rack crea un cuello de botella físico infranqueable'.
+       - En fitness/salud/ciencia: 'La creatina elimina el cuello de botella de regeneración de ATP'; 'La leucina supera el cuello de botella de activación de mTOR'; 'La cafeína despeja el cuello de botella de la fatiga en los receptores de adenosina'.
+    2. Identifica siempre el factor limitante de cada sistema y cómo se resuelve o colapsa.
+
+    REGLAS EDITORIALES Y DE LOCUCIÓN ESTRICTAS (AISLAMIENTO TOTAL):
+    1. EL CAMPO "text" ES EXCLUSIVAMENTE LO QUE EL LOCUTOR DICE PALABRA POR PALABRA.
+    2. TOTALMENTE PROHIBIDO incluir acotaciones visuales, B-roll, direcciones de cámara o notas entre paréntesis (ej: PROHIBIDO poner '[Plano macro]', '(Corte a gráfico)', 'un especialista mira a cámara', 'el macro revela'). Cualquier descripción visual pertenece exclusivamente al storyboard posterior.
+    3. EXTENSIÓN OBLIGATORIA: El guion COMPLETO debe tener como MÍNIMO {min_palabras} palabras reales narradas en total. No resumas; desarrolla en profundidad cada dato técnico, consecuencias y ejemplos para garantizar la duración objetivo.
+    4. HOOK INICIAL (0-5s): Prohibido abrir con saludos o introducciones vacías. Empieza en mitad del clímax con una cifra perturbadora.
+    5. LONGITUD POR BLOQUE: Cada bloque debe tener entre 25 y 40 palabras conversacionales continuas.
+    6. TONO: Ritmo ágil, periodismo de investigación, verbos directos en presente activo, sin adjetivos genéricos ("increíble", "asombroso").
+    7. ESTRUCTURA: Conflicto inicial -> Revelación de datos poco conocidos -> Consecuencias reales -> Conclusión con punto de vista contundente.
 
     Divide el guion en bloques cronológicos para la voz en off.
     Responde ÚNICAMENTE con un JSON válido:
-    {{"blocks": [{{"id": "b1", "order": 1, "text": "...", "estimated_seconds": 12.0}}]}}
+    {{"blocks": [{{"id": "b1", "order": 1, "text": "...", "estimated_seconds": 13.0}}]}}
     """
     response = _call_gemini_with_retry(prompt)
     data = _parse_json_safely(response.text)
@@ -329,23 +373,11 @@ def _detect_aspect_ratio(project) -> str:
 # ============================================================================
 # KEN BURNS (zoom suave) — versión corregida contra el jitter
 # ============================================================================
-#
-# CAMBIOS clave respecto a la versión original que te hacía micro-saltos:
-#
-#  1. Canvas de trabajo MUCHO más grande. Antes: 2560px (para salida 1920px).
-#     Con solo 1.33x de margen, el crop de zoompan avanza ~0.5px/frame, se
-#     cuantiza y provoca el "tirón". Ahora: 6000px → ~1.5px/frame → fluido.
-#
-#  2. Se ELIMINA la alternancia zoom-in/zoom-out. Alternar dirección hacía que
-#     el ojo percibiera un "rebote" en cada corte. Ahora siempre zoom-in suave.
-#
-#  3. Acumulador `zoom+delta` en vez de `1+delta*on`. El segundo redondea mal
-#     en frames intermedios y produce saltos discretos.
 
 KENBURNS_FPS = 30
 KENBURNS_ZOOM_START = 1.0
 KENBURNS_ZOOM_END = 1.08
-KENBURNS_UPSCALE_LONG_EDGE = 6000   # antes 2560 → ESTA es la clave del arreglo
+KENBURNS_UPSCALE_LONG_EDGE = 6000   # 6000px para eliminar el tirón y cuantización
 
 
 def _build_kenburns_segment(img_path: Path, seg_path: Path, duration: float,
@@ -353,30 +385,23 @@ def _build_kenburns_segment(img_path: Path, seg_path: Path, duration: float,
                             shot_index: int, focus_x: int = 50, focus_y: int = 50) -> list[str]:
     total_frames = max(int(round(duration * KENBURNS_FPS)), 1)
     
-    # Coordenadas relativas del punto de enfoque (0.0 a 1.0)
     fx = max(0.0, min(1.0, focus_x / 100.0))
     fy = max(0.0, min(1.0, focus_y / 100.0))
 
-    # Paso de zoom adaptado a la duración exacta del plano
     zoom_step = 0.08 / max(total_frames, 1)
-
-    # Alternar patrones de cámara según el plano (i % 3)
     movimiento = shot_index % 3
 
     if movimiento == 0:
-        # Modo 0: Zoom In progresivo hacia el foco durante toda la toma
         z_expr = f"min(zoom+{zoom_step:.8f}, 1.08)"
         x_expr = f"(iw-iw/zoom)*{fx:.4f}"
         y_expr = f"(ih-ih/zoom)*{fy:.4f}"
     elif movimiento == 1:
-        # Modo 1: Zoom Out continuo revelando la escena
         z_expr = f"max(1.08-{zoom_step:.8f}*on, 1.0)"
         x_expr = f"(iw-iw/zoom)*{fx:.4f}"
         y_expr = f"(ih-ih/zoom)*{fy:.4f}"
     else:
-        # Modo 2: Paneo lateral continuo sin riesgo de desbordar márgenes
         z_expr = "1.08"
-        pan_rango = 0.12  # Recorrido del desplazamiento (12% del margen)
+        pan_rango = 0.12
         pan_inicio = max(0.0, min(1.0 - pan_rango, fx - (pan_rango / 2.0)))
         x_expr = f"(iw-iw/zoom)*({pan_inicio:.4f} + (on/{total_frames})*{pan_rango:.4f})"
         y_expr = f"(ih-ih/zoom)*{fy:.4f}"
@@ -417,15 +442,6 @@ def _build_kenburns_segment(img_path: Path, seg_path: Path, duration: float,
 # ============================================================================
 
 async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Path) -> list[dict]:
-    """
-    Sintetiza con Edge-TTS troceando el texto en bloques de ~350 caracteres.
-
-    Si Edge-TTS NO emite WordBoundary (ocurre en algunas versiones/entornos),
-    se genera un fallback proporcional DENTRO DE CADA BLOQUE: sabemos la
-    duración exacta de cada trozo (ffprobe) y repartimos las palabras según
-    su longitud. Esto es MUCHO más preciso que repartir uniformemente todo
-    el audio, porque respeta los límites reales de cada bloque.
-    """
     def _split_text(s: str, max_len: int = 350) -> list[str]:
         frases = re.split(r'(?<=[\.\!\?\:;])\s+', s.strip())
         chunks, actual = [], ""
@@ -465,14 +481,11 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
         chunk_files.append(chunk_path)
         boundaries: list[dict] = []
 
-        # Limpieza de signos para modular respiración
         chunk_limpio = chunk.replace("...", " — ").replace(" - ", ", ")
         try:
-            communicate = edge_tts.Communicate(chunk_limpio, voice, rate="+6%",pitch="+0Hz", boundary="WordBoundary")
+            communicate = edge_tts.Communicate(chunk_limpio, voice, rate="+6%", pitch="+0Hz", boundary="WordBoundary")
             with open(chunk_path, "wb") as f:
                 async for piece in communicate.stream():
-                    # Acceso robusto: funciona con dicts y con objetos en distintas
-                    # versiones de edge-tts.
                     if isinstance(piece, dict):
                         ptype = piece.get("type")
                         data = piece.get("data")
@@ -496,10 +509,8 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
                         })
         except Exception as e:
             print(f"[TTS] Error en bloque {idx+1}: {e}")
-            # Asegura que al menos hay un MP3 (aunque vacío) para no romper el concat.
             chunk_path.touch(exist_ok=True)
 
-        # Inyectar puntuación y mayúsculas originales sobre las marcas de tiempo
         palabras_orig = [w for w in chunk_limpio.split() if any(c.isalnum() for c in w)]
         if len(palabras_orig) == len(boundaries):
             for b, orig_w in zip(boundaries, palabras_orig):
@@ -510,7 +521,6 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
         chunk_durations.append(dur)
         print(f"[TTS] Bloque {idx+1}/{len(chunks)}: {len(boundaries)} WordBoundary, {dur:.2f}s de audio.")
 
-    # Concatenar los MP3 de cada bloque en un único archivo
     concat_txt = tmp_dir / "concat.txt"
     with open(concat_txt, "w", encoding="utf-8") as f:
         for cf in chunk_files:
@@ -523,13 +533,11 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
     if res_join.returncode != 0:
         raise RuntimeError(f"Fallo al unir chunks TTS: {res_join.stderr}")
 
-    # Construir la lista de palabras
     total_boundaries = sum(len(b) for b in chunk_boundaries)
     palabras: list[dict] = []
     offset = 0.0
 
     if total_boundaries > 0:
-        # Caso ideal: usar los WordBoundary reales
         for boundaries, dur in zip(chunk_boundaries, chunk_durations):
             for b in boundaries:
                 palabras.append({
@@ -539,8 +547,6 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
                 })
             offset += dur
     else:
-        # Fallback proporcional: dentro de cada bloque repartimos por longitud
-        # de palabra. Mucho mejor que el fallback anterior (uniforme global).
         print("[TTS] Sin WordBoundary: usando fallback proporcional por bloque.")
         for chunk, dur in zip(chunks, chunk_durations):
             ws = chunk.split()
@@ -560,9 +566,6 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
                 sub += d
             offset += dur
 
-    # Ajuste fino: comparar el fin estimado con la duración real del MP3 unido.
-    # La concatenación de MP3 con `-c copy` a veces añade unos ms de padding;
-    # si la diferencia es apreciable, reescalamos linealmente.
     dur_final = _get_audio_duration(output_path)
     if palabras and dur_final > 0:
         ultimo_fin = palabras[-1]["end"]
@@ -574,7 +577,6 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
                 p["start"] *= factor
                 p["end"] *= factor
 
-    # Limpieza
     for cf in chunk_files:
         cf.unlink(missing_ok=True)
     concat_txt.unlink(missing_ok=True)
@@ -601,8 +603,6 @@ def _generar_subtitulos_ass(palabras: list[dict], output_path: Path,
         return False
         
     res_w, res_h = resolution
-    
-    # 1. Aumento de tamaño (+24%): 42 -> 52 en horizontal, 54 -> 64 en vertical
     font_size = 64 if is_vertical else 52
     margen_v = int(res_h * 0.18) if is_vertical else int(res_h * 0.11)
 
@@ -631,16 +631,9 @@ def _generar_subtitulos_ass(palabras: list[dict], output_path: Path,
             curr_end = palabra.get("end", curr_start)
             gap = curr_start - prev_end
 
-            # A. ¿La palabra anterior cerraba una frase? (. ? ! : ;)
             termina_oracion = any(prev_text.endswith(p) for p in PUNTUACION_TERMINAL)
-
-            # B. ¿Pausa de respiración/silencio entre oraciones (> 0.25s)?
             pausa_notable = gap > 0.25
-
-            # C. ¿La nueva palabra empieza con mayúscula y ya hay palabras en pantalla?
             es_mayuscula = (texto[0].isupper() and len(actual) >= 2 and not prev_text.endswith(","))
-
-            # D. Límites de lectura (máximo 4 palabras para no saturar en pantalla móvil)
             limite_palabras = len(actual) >= max_palabras_por_cue
             limite_tiempo = (curr_end - actual[0]["start"]) > max_segundos_por_cue
 
@@ -682,7 +675,6 @@ def _escapar_ruta_ffmpeg_filtro(path: Path) -> str:
 
 
 def _elegir_pista_bgm(categoria: str | None = None) -> Path | None:
-    """Busca en una subcarpeta temática (ej: assets/bgm/documental/). Si no existe o está vacía, busca en la raíz."""
     if categoria and categoria.lower() != "none":
         subcarpeta = BGM_LIBRARY_DIR / categoria.lower()
         if subcarpeta.exists():
@@ -690,13 +682,11 @@ def _elegir_pista_bgm(categoria: str | None = None) -> Path | None:
             if candidatas:
                 return random.choice(candidatas)
 
-    # Búsqueda global si no hay categoría específica
     todas = list(BGM_LIBRARY_DIR.rglob("*.mp3")) + list(BGM_LIBRARY_DIR.rglob("*.wav"))
     return random.choice(todas) if todas else None
 
 
 def _get_audio_duration(audio_path: Path) -> float:
-    """Duración del archivo de audio según ffprobe (INCLUYE silencio de cola)."""
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
@@ -709,7 +699,7 @@ def _get_audio_duration(audio_path: Path) -> float:
 
 
 # ============================================================================
-# RENDER PRINCIPAL (con el arreglo real de sincronización)
+# RENDER PRINCIPAL
 # ============================================================================
 
 def render_video(project) -> dict:
@@ -722,7 +712,10 @@ def render_video(project) -> dict:
     output_path = RENDERS_DIR / output_filename
 
     script_blocks = project.script or []
-    full_voice_text = " ".join([b.get("text", "") for b in script_blocks]) or project.description or project.title
+    raw_text = " ".join([b.get("text", "") for b in script_blocks]) or project.description or project.title
+
+    # AISLAMIENTO ESTRICTO: Purga acotaciones de cámara, corchetes y B-roll antes del audio
+    full_voice_text = limpiar_texto_locucion(raw_text)
 
     audio_path = RENDERS_DIR / f"{project.id}_voice.mp3"
     voice_name = "es-ES-AlvaroNeural"
@@ -738,8 +731,6 @@ def render_video(project) -> dict:
         loop.close()
 
     audio_file_duration = _get_audio_duration(audio_path)
-    # *** ESTE es el arreglo: usamos el FIN REAL de la locución, no la duración del MP3
-    # (Edge-TTS añade silencio al final del MP3 y eso desincronizaba los subtítulos).
     last_word_end = palabras[-1]["end"] if palabras else audio_file_duration
     print(f"[Sync] Duración MP3 (ffprobe): {audio_file_duration:.2f}s | "
           f"Fin real locución: {last_word_end:.2f}s | "
@@ -784,8 +775,7 @@ def render_video(project) -> dict:
             raise RuntimeError(f"Fallo de FFmpeg en el plano {shot['id']}: {res.stderr}")
         segment_files.append(seg_path)
 
-    # 5) Concatenar. -avoid_negative_ts + -fflags +genpts fuerzan PTS desde 0,
-    #    imprescindible para que los subtítulos caigan sobre el frame correcto.
+    # 5) Concatenar
     concat_list_path = RENDERS_DIR / f"{project.id}_concat.txt"
     with open(concat_list_path, "w", encoding="utf-8") as f:
         for seg in segment_files:
