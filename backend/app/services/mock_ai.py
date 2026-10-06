@@ -125,7 +125,11 @@ def generate_script(title: str, description: str, target_duration_seconds: int, 
     style_guide = ""
     if reference_analysis:
         style_guide = f"Toma como referencia un ritmo de corte promedio de {reference_analysis.get('avg_shot_seconds', 3.5)}s."
-        
+
+    # A 145 palabras por minuto (+6% de velocidad en Álvaro):
+    # Para 10 minutos (600s) = ~1.450 palabras. Para 8 minutos (480s) = ~1.160 palabras.
+    min_palabras = int((target_duration_seconds / 60) * 145)
+
     prompt = f"""
     Eres un guionista y editor de contenido viral de alto impacto (documental/ensayo visual).
     Tema: {title}
@@ -133,11 +137,12 @@ def generate_script(title: str, description: str, target_duration_seconds: int, 
     Duración objetivo total: {target_duration_seconds} segundos.
     {style_guide}
 
-    REGLAS EDITORIALES ESTRICTAS (Anti-contenido repetitivo):
-    1. HOOK INICIAL (0-5s): Prohibido abrir con saludos, presentaciones o introducciones vacías ("Hoy hablaremos...", "El tema de..."). Empieza en mitad del clímax, con una cifra perturbadora, una ironía o una paradoja.
-    2. PATTERN INTERRUPTS: Cada bloque narrativo debe durar entre 8 y 16 segundos máximo y terminar con una frase que impulse al espectador al siguiente punto.
-    3. TONO: Ritmo ágil, periodismo de investigación, verbos directos en presente activo, sin adjetivos genéricos ("increíble", "asombroso").
-    4. ESTRUCTURA: Conflicto inicial -> Revelación de datos poco conocidos -> Consecuencias reales -> Conclusión con punto de vista contundente.
+    REGLAS EDITORIALES ESTRICTAS:
+    1. EXTENSIÓN OBLIGATORIA: El guion COMPLETO debe tener como MÍNIMO {min_palabras} palabras reales narradas en total. No resumas; desarrolla en profundidad cada dato técnico, consecuencias y ejemplos.
+    2. HOOK INICIAL (0-5s): Prohibido abrir con saludos o introducciones vacías. Empieza en mitad del clímax con una cifra perturbadora.
+    3. LONGITUD POR BLOQUE: Cada bloque debe tener entre 25 y 40 palabras de locución continua.
+    4. TONO: Ritmo ágil, periodismo de investigación, verbos directos en presente activo, sin adjetivos genéricos.
+    5. ESTRUCTURA: Conflicto inicial -> Revelación de datos poco conocidos -> Consecuencias reales -> Conclusión con punto de vista contundente.
 
     Divide el guion en bloques cronológicos para la voz en off.
     Responde ÚNICAMENTE con un JSON válido:
