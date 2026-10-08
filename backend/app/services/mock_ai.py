@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv(find_dotenv())
 
-VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3.6-flash")
+VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3.8-flash")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
 
@@ -72,37 +72,58 @@ DEFAULT_VOICES = [
     {"provider": "elevenlabs", "provider_voice_id": "es-lucia", "name": "Lucía", "gender": "female", "language": "es", "tone": "coloquial"},
 ]
 
+# Lista de modelos compatibles activos en tu cuenta (orden de prioridad de ejecución)
+FALLBACK_MODELS = [
+    os.getenv("VISION_MODEL", "gemini-3.8-flash"),
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-pro",
+]
 
-def _call_gemini_with_retry(prompt: str, max_retries: int = 7, json_mode: bool = True):
+def _call_gemini_with_retry(prompt: str, max_retries: int = 1, json_mode: bool = True):
     if not gemini_client:
         raise ValueError("GEMINI_API_KEY no está configurada en el archivo .env")
-    delay = 5.0
-    config = types.GenerateContentConfig(response_mime_type="application/json") if json_mode else None
-    model_to_use = VISION_MODEL
 
-    for attempt in range(max_retries):
+    config = types.GenerateContentConfig(response_mime_type="application/json") if json_mode else None
+    
+    # Eliminar duplicados manteniendo el orden de prioridad
+    modelos_a_probar = []
+    for m in FALLBACK_MODELS:
+        m_clean = m.replace("models/", "").strip()
+        if m_clean and m_clean not in modelos_a_probar:
+            modelos_a_probar.append(m_clean)
+
+    ultimo_error = None
+
+    for model_name in modelos_a_probar:
         try:
-            return gemini_client.models.generate_content(model=model_to_use, contents=prompt, config=config)
+            print(f"[Gemini] Solicitando con {model_name}...")
+            return gemini_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config
+            )
         except Exception as e:
             err_msg = str(e)
-            is_transient = any(code in err_msg for code in ["503", "429", "UNAVAILABLE", "high demand", "ResourceExhausted"])
-            if is_transient and attempt < max_retries - 1:
-                # Fallback automático si gemini-3.6-flash está saturado
-                if ("503" in err_msg or "high demand" in err_msg) and attempt >= 2 and model_to_use == VISION_MODEL:
-                    print("[Gemini 503] Alta demanda persistente. Cambiando temporalmente a modelo de respaldo (gemini-2.0-flash)...")
-                    model_to_use = "gemini-2.0-flash"
-
-                match = re.search(r"retry in ([\d\.]+)s", err_msg, re.IGNORECASE)
-                if match:
-                    wait_time = float(match.group(1)) + 2.0
-                    print(f"[Gemini 429] Cuota alcanzada. Esperando {wait_time:.1f}s...")
-                else:
-                    wait_time = delay
-                    delay *= 1.8
-                    print(f"[Gemini Espera] Reintento {attempt + 1}/{max_retries} (503/429). Esperando {wait_time:.1f}s...")
-                time.sleep(wait_time)
+            ultimo_error = e
+            
+            # Si el modelo está saturado, sin cuota o no disponible, saltar al siguiente de inmediato
+            es_fallback = any(k in err_msg for k in [
+                "503", "429", "404", "UNAVAILABLE", "high demand", 
+                "ResourceExhausted", "not found", "no longer available"
+            ])
+            
+            if es_fallback:
+                print(f"[Gemini Fallback] {model_name} no disponible ({err_msg[:70]}...). Pasando al siguiente modelo...")
                 continue
+            
+            # Errores estructurales no recuperables (ej. sintaxis o API key inválida)
             raise e
+
+    raise RuntimeError(f"Todos los modelos de la lista de respaldo fallaron. Último error: {ultimo_error}")
 
 
 def _parse_json_safely(text: str) -> dict:
