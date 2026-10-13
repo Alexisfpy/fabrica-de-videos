@@ -310,7 +310,7 @@ def generate_script(title: str, description: str, target_duration_seconds: int, 
     {style_guide}
 
     FILOSOFÍA Y FIRMA DEL CANAL ("CUELLO DE BOTELLA"):
-    1. Debes articular las explicaciones utilizando el concepto de 'cuello de botella' como marco analítico recurrente. Sin embargo, limita estrictamente el uso de la frase exacta "cuello de botella" a un MÁXIMO de 4 veces en todo el guion. Para el resto de ocasiones, usa sinónimos como "limitación crítica", "obstáculo estructural" o "punto de estrangulamiento"
+    1. Debes articular las explicaciones utilizando el concepto de 'cuello de botella' como marco analítico recurrente. Sin embargo, limita estrictamente el uso de la frase exacta "cuello de botella" a un MÁXIMO de 2 veces en todo el guion. Para el resto de ocasiones, usa sinónimos como "limitación crítica", "obstáculo estructural" o "punto de estrangulamiento"
     2. Identifica siempre el factor limitante de cada sistema y cómo se resuelve o colapsa.
 
     REGLAS EDITORIALES Y DE LOCUCIÓN ESTRICTAS:
