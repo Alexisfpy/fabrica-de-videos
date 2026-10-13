@@ -1,14 +1,17 @@
 import asyncio
 import base64
-import subprocess
+import concurrent.futures
+import gc
 import io
 import json
 import os
 import random
 import re
+import shutil
+import subprocess
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
@@ -16,6 +19,8 @@ import edge_tts
 from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
+
+import azure.cognitiveservices.speech as speechsdk
 
 load_dotenv(find_dotenv())
 
@@ -30,6 +35,9 @@ CF_MODEL = os.getenv("CLOUDFLARE_AI_MODEL", "@cf/black-forest-labs/flux-1-schnel
 
 _cf_last_call = 0.0
 _CF_MIN_INTERVAL = 1.0
+
+# Margen musical al final para pantallas finales / tarjetas interactivas de YouTube
+OUTRO_BUFFER_SECONDS = 7.0
 
 ASSETS_DIR = Path("renders/assets")
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -72,7 +80,7 @@ DEFAULT_VOICES = [
     {"provider": "elevenlabs", "provider_voice_id": "es-lucia", "name": "Lucía", "gender": "female", "language": "es", "tone": "coloquial"},
 ]
 
-# Lista de modelos compatibles activos en tu cuenta (orden de prioridad de ejecución)
+# Cascada de modelos disponibles en tu cuenta para evitar errores 503 / 429
 FALLBACK_MODELS = [
     os.getenv("VISION_MODEL", "gemini-3.8-flash"),
     "gemini-3.7-flash",
@@ -83,13 +91,13 @@ FALLBACK_MODELS = [
     "gemini-2.5-pro",
 ]
 
+
 def _call_gemini_with_retry(prompt: str, max_retries: int = 1, json_mode: bool = True):
     if not gemini_client:
         raise ValueError("GEMINI_API_KEY no está configurada en el archivo .env")
 
     config = types.GenerateContentConfig(response_mime_type="application/json") if json_mode else None
     
-    # Eliminar duplicados manteniendo el orden de prioridad
     modelos_a_probar = []
     for m in FALLBACK_MODELS:
         m_clean = m.replace("models/", "").strip()
@@ -100,7 +108,7 @@ def _call_gemini_with_retry(prompt: str, max_retries: int = 1, json_mode: bool =
 
     for model_name in modelos_a_probar:
         try:
-            print(f"[Gemini] Solicitando con {model_name}...")
+            print(f"[Gemini] Solicitando con {model_name}...", flush=True)
             return gemini_client.models.generate_content(
                 model=model_name,
                 contents=prompt,
@@ -110,17 +118,14 @@ def _call_gemini_with_retry(prompt: str, max_retries: int = 1, json_mode: bool =
             err_msg = str(e)
             ultimo_error = e
             
-            # Si el modelo está saturado, sin cuota o no disponible, saltar al siguiente de inmediato
             es_fallback = any(k in err_msg for k in [
                 "503", "429", "404", "UNAVAILABLE", "high demand", 
                 "ResourceExhausted", "not found", "no longer available"
             ])
             
             if es_fallback:
-                print(f"[Gemini Fallback] {model_name} no disponible ({err_msg[:70]}...). Pasando al siguiente modelo...")
+                print(f"[Gemini Fallback] {model_name} no disponible ({err_msg[:75]}...). Pasando al siguiente modelo...", flush=True)
                 continue
-            
-            # Errores estructurales no recuperables (ej. sintaxis o API key inválida)
             raise e
 
     raise RuntimeError(f"Todos los modelos de la lista de respaldo fallaron. Último error: {ultimo_error}")
@@ -149,20 +154,133 @@ def analyze_reference(reference_url: str) -> dict:
     return _parse_json_safely(response.text)
 
 
+# ============================================================================
+# 1. SISTEMA DINÁMICO DE FONÉTICA (BASE + DETECCIÓN GEMINI)
+# ============================================================================
+
+DICCIONARIO_FONETICA_BASE = {
+    r"\bGPU\b": "G-P-U",
+    r"\bGPUs\b": "G-P-Us",
+    r"\bCPU\b": "C-P-U",
+    r"\bCPUs\b": "C-P-Us",
+    r"\bTPU\b": "T-P-U",
+    r"\bTPUs\b": "T-P-Us",
+    r"\bSMR\b": "S-M-R",
+    r"\bSMRs\b": "S-M-Rs",
+    r"\bLLM\b": "L-L-M",
+    r"\bLLMs\b": "L-L-Ms",
+    r"\bAPI\b": "A-P-I",
+    r"\bAPIs\b": "A-P-Is",
+    r"\bkW\b": "kilovatios",
+    r"\bMW\b": "megavatios",
+    r"\bGW\b": "gigavatios",
+}
+
+REVERSION_SUBTITULOS_BASE = {
+    "G-P-U": "GPU",
+    "G-P-Us": "GPUs",
+    "C-P-U": "CPU",
+    "C-P-Us": "CPUs",
+    "T-P-U": "TPU",
+    "T-P-Us": "TPUs",
+    "S-M-R": "SMR",
+    "S-M-Rs": "SMRs",
+    "L-L-M": "LLM",
+    "L-L-Ms": "LLMs",
+    "A-P-I": "API",
+    "A-P-Is": "APIs",
+}
+
+
+def detectar_fonetica_con_ia(texto: str) -> list[dict]:
+    prompt = f"""
+    Eres un director de doblaje y lingüista experto en síntesis de voz (Text-to-Speech) en español de España.
+    Analiza este texto narrativo y detecta:
+    1. Siglas y acrónimos técnicos (ej: TSMC, CUDA, ASIC, HBM3e, PCIe, FP8, MoE, DRAM).
+    2. Nombres propios de personas, empresas, lugares y modelos en inglés o extranjeros (ej: Ilya Sutskever -> "Ilia Súts-ke-ver", Mark Zuckerberg -> "Mark Zúker-berg", Jensen Huang -> "Yensen Juang", Sam Altman -> "Sam Óltman", Microsoft -> "Máicrosoft", Three Mile Island -> "Tri-Mail-Áiland", Susquehanna -> "Sas-que-jana", Blackwell -> "Blak-üel", DeepSeek -> "Dip-Sik").
+    3. Anglicismos técnicos donde una adaptación fonética en español mejore la dicción natural del sintetizador (ej: hardware -> "járd-üer", software -> "sóft-üer", baseload -> "beis-lód", racks -> "raks", direct-to-chip -> "direct-tu-chip", datacenter -> "data-sénter").
+
+    REGLAS:
+    - NO incluyas palabras normales en español.
+    - NO incluyas siglas ya estándar si se leen de forma obvia en español.
+    - Responde ÚNICAMENTE con un JSON válido:
+    {{"sustituciones": [
+        {{"original": "TSMC", "tts": "T-S-M-C"}},
+        {{"original": "Zuckerberg", "tts": "Zúker-berg"}}
+    ]}}
+
+    Texto a analizar:
+    {texto[:5000]}
+    """
+    try:
+        response = _call_gemini_with_retry(prompt)
+        data = _parse_json_safely(response.text)
+        return data.get("sustituciones", [])
+    except Exception as e:
+        print(f"[Fonética IA] Aviso: No se pudo generar fonética dinámica ({e}). Se usará solo la base.", flush=True)
+        return []
+
+
+def generar_diccionarios_foneticos(texto: str, project_id: str = "default") -> tuple[dict, dict]:
+    dicc_fonetica = dict(DICCIONARIO_FONETICA_BASE)
+    dicc_reversion = dict(REVERSION_SUBTITULOS_BASE)
+
+    cache_file = RENDERS_DIR / f"{project_id}_phonetics.json"
+    sustituciones_ia = []
+
+    if cache_file.exists():
+        try:
+            sustituciones_ia = json.loads(cache_file.read_text(encoding="utf-8"))
+            print(f"[Fonética IA] Cargadas {len(sustituciones_ia)} reglas desde caché ({cache_file.name}).", flush=True)
+        except Exception:
+            sustituciones_ia = []
+
+    if not sustituciones_ia and gemini_client:
+        print("[Fonética IA] Analizando guion con Gemini para detectar siglas y nombres extranjeros...", flush=True)
+        sustituciones_ia = detectar_fonetica_con_ia(texto)
+        if sustituciones_ia:
+            try:
+                cache_file.write_text(json.dumps(sustituciones_ia, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"[Fonética IA] {len(sustituciones_ia)} términos detectados y guardados en caché.", flush=True)
+            except Exception:
+                pass
+
+    for item in sustituciones_ia:
+        orig = item.get("original", "").strip()
+        tts = item.get("tts", "").strip()
+        if orig and tts and orig.lower() != tts.lower():
+            patron = rf"\b{re.escape(orig)}\b"
+            dicc_fonetica[patron] = tts
+            dicc_reversion[tts] = orig
+
+    return dicc_fonetica, dicc_reversion
+
+
+def aplicar_sustitucion_fonetica(texto: str, dicc_fonetica: dict) -> str:
+    if not texto:
+        return ""
+    t = texto
+    for patron, reemplazo in dicc_fonetica.items():
+        t = re.sub(patron, reemplazo, t, flags=re.IGNORECASE)
+    return t
+
+
+def restaurar_ortografia_subtitulos(texto: str, dicc_reversion: dict) -> str:
+    if not texto:
+        return ""
+    t = texto
+    for fon, orig in dicc_reversion.items():
+        t = re.sub(re.escape(fon), orig, t, flags=re.IGNORECASE)
+    return t
+
+
 def limpiar_texto_locucion(texto: str) -> str:
-    """
-    Elimina cualquier acotación de dirección, notas de cámara, corchetes,
-    paréntesis técnicos o menciones a B-roll antes de enviar a Edge-TTS.
-    Garantiza que al narrador solo llegue texto conversacional puro.
-    """
     if not texto:
         return ""
 
-    # 1. Eliminar contenido entre corchetes o paréntesis: [Plano detalle], (Voz en off), [Corte]
     t = re.sub(r"\[.*?\]", " ", texto)
     t = re.sub(r"\(.*?\)", " ", t)
 
-    # 2. Eliminar prefijos técnicos habituales de guion
     patrones_tecnicos = [
         r"(?i)\b(b-roll|b_roll|broll)\b\s*:?",
         r"(?i)\b(primerísimo\s+primer\s+plano|primer\s+plano|plano\s+[a-zá-ú]+|toma\s+[a-zá-ú]+|cámara\s+[a-zá-ú]+)\s*:?",
@@ -173,7 +291,6 @@ def limpiar_texto_locucion(texto: str) -> str:
     for patron in patrones_tecnicos:
         t = re.sub(patron, " ", t)
 
-    # 3. Limpiar dobles espacios y saltos de línea sobrantes
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -183,10 +300,8 @@ def generate_script(title: str, description: str, target_duration_seconds: int, 
     if reference_analysis:
         style_guide = f"Toma como referencia un ritmo de corte promedio de {reference_analysis.get('avg_shot_seconds', 3.5)}s."
 
-    # A 145 palabras por minuto (+6% de velocidad en Álvaro):
-    # Para 10 minutos (600s) = ~1.450 palabras. Para 8 minutos (480s) = ~1.160 palabras.
     min_palabras = int((target_duration_seconds / 60) * 145)
-    # CAMBIAR AQUI LA FILOSOFÍA
+
     prompt = f"""
     Eres el guionista principal de un canal de divulgación y ensayos visuales de alto rigor técnico.
     Tema: {title}
@@ -195,19 +310,17 @@ def generate_script(title: str, description: str, target_duration_seconds: int, 
     {style_guide}
 
     FILOSOFÍA Y FIRMA DEL CANAL ("CUELLO DE BOTELLA"):
-    1. Debes articular las explicaciones utilizando el concepto de 'cuello de botella' como marco analítico recurrente.
-       - En tecnología/energía: 'La red eléctrica es el verdadero cuello de botella de la computación'; 'La disipación térmica por rack crea un cuello de botella físico infranqueable'.
-       - En fitness/salud/ciencia: 'La creatina elimina el cuello de botella de regeneración de ATP'; 'La leucina supera el cuello de botella de activación de mTOR'; 'La cafeína despeja el cuello de botella de la fatiga en los receptores de adenosina'.
+    1. Debes articular las explicaciones utilizando el concepto de 'cuello de botella' como marco analítico recurrente. Sin embargo, limita estrictamente el uso de la frase exacta "cuello de botella" a un MÁXIMO de 4 veces en todo el guion. Para el resto de ocasiones, usa sinónimos como "limitación crítica", "obstáculo estructural" o "punto de estrangulamiento"
     2. Identifica siempre el factor limitante de cada sistema y cómo se resuelve o colapsa.
 
-    REGLAS EDITORIALES Y DE LOCUCIÓN ESTRICTAS (AISLAMIENTO TOTAL):
+    REGLAS EDITORIALES Y DE LOCUCIÓN ESTRICTAS:
     1. EL CAMPO "text" ES EXCLUSIVAMENTE LO QUE EL LOCUTOR DICE PALABRA POR PALABRA.
-    2. TOTALMENTE PROHIBIDO incluir acotaciones visuales, B-roll, direcciones de cámara o notas entre paréntesis (ej: PROHIBIDO poner '[Plano macro]', '(Corte a gráfico)', 'un especialista mira a cámara', 'el macro revela'). Cualquier descripción visual pertenece exclusivamente al storyboard posterior.
-    3. EXTENSIÓN OBLIGATORIA: El guion COMPLETO debe tener como MÍNIMO {min_palabras} palabras reales narradas en total. No resumas; desarrolla en profundidad cada dato técnico, consecuencias y ejemplos para garantizar la duración objetivo.
+    2. TOTALMENTE PROHIBIDO incluir acotaciones visuales, B-roll, direcciones de cámara o notas entre paréntesis.
+    3. EXTENSIÓN OBLIGATORIA: El guion COMPLETO debe tener como MÍNIMO {min_palabras} palabras reales narradas en total.
     4. HOOK INICIAL (0-5s): Prohibido abrir con saludos o introducciones vacías. Empieza en mitad del clímax con una cifra perturbadora.
     5. LONGITUD POR BLOQUE: Cada bloque debe tener entre 25 y 40 palabras conversacionales continuas.
-    6. TONO: Ritmo ágil, periodismo de investigación, verbos directos en presente activo, sin adjetivos genéricos ("increíble", "asombroso").
-    7. ESTRUCTURA: Conflicto inicial -> Revelación de datos poco conocidos -> Consecuencias reales -> Conclusión con punto de vista contundente.
+    6. TONO: Ritmo ágil, periodismo de investigación, verbos directos en presente activo.
+    7. ESTRUCTURA: Conflicto inicial -> Revelación de datos poco conocidos -> Consecuencias reales -> Conclusión contundente.
 
     Divide el guion en bloques cronológicos para la voz en off.
     Responde ÚNICAMENTE con un JSON válido:
@@ -241,6 +354,13 @@ def analizar_estilo_proyecto(tema: str, sinopsis: str) -> dict:
         return fallback
 
 
+PROMPT_NEGATIVO_FLUX = (
+    "clean industrial scene, strictly no text, no letters, no words, no fonts, "
+    "no typography, no watermark, no labels, no signs, no subtitles, no billboards, "
+    "no readable logos, blank dark screens, clean display panels without letters"
+)
+
+
 def generate_storyboard(script: list[dict],
                         estilo_global: str = "Cinematic documentary style, realistic lighting, high detail, 35mm photograph",
                         entidades: dict | None = None) -> list[dict]:
@@ -252,9 +372,10 @@ def generate_storyboard(script: list[dict],
     Guion: {json.dumps(script, ensure_ascii=False)}
 
     REGLAS EDITORIALES DE EDICIÓN:
-    1. DURACIÓN: Cada plano DEBE durar entre 2.0 y 3.5 segundos máximo. Divide los bloques de texto largos en varios planos complementarios (ej. plano general del contexto -> macro detalle del objeto/rostro).
+    1. DURACIÓN: Cada plano DEBE durar entre 2.0 y 3.5 segundos máximo.
     2. VARIEDAD DE ENCUADRE: Alterna constantemente entre 'extreme close-up', 'medium shot', 'low angle dramatic shot' y 'wide panoramic shot'.
-    3. PROMPT EN: Termina siempre con: ", 8k resolution, crisp details, sharp focus, high texture detail, cinematic photography, 35mm film aesthetics".
+    3. REGLA ESTRICTA ANTI-TEXTO: TOTALMENTE PROHIBIDO describir texto legible, carteles, titulares o rótulos en monitores.
+    4. PROMPT EN: Termina siempre con: ", {PROMPT_NEGATIVO_FLUX}, 8k resolution, crisp details, sharp focus, high texture detail, cinematic photography, 35mm film aesthetics".
 
     Devuelve para cada plano: id, order, description, prompt_en, shot_type, source, duration_seconds.
     Responde ÚNICAMENTE con: {{"storyboard": [...]}}
@@ -268,7 +389,11 @@ def construir_prompt_imagen(descripcion_plano: str, estilo_global: str, entidade
     texto = descripcion_plano
     for nombre, rasgos in entidades.items():
         texto = re.sub(re.escape(nombre), rasgos, texto, flags=re.IGNORECASE)
-    return f"{texto}, {estilo_global}, medium shot, shallow depth of field, 8k resolution, crisp details, sharp focus, high texture detail, cinematic photography, 35mm film aesthetics"
+    return (
+        f"{texto}, {estilo_global}, {PROMPT_NEGATIVO_FLUX}, medium shot, "
+        f"shallow depth of field, 8k resolution, crisp details, sharp focus, "
+        f"high texture detail, cinematic photography, 35mm film aesthetics"
+    )
 
 
 def _create_slide_image(text: str, shot_type: str, output_path: Path):
@@ -301,7 +426,7 @@ def _generate_ai_image(prompt_text: str, output_path: Path, max_retries: int = 3
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         raise ValueError("Faltan CLOUDFLARE_ACCOUNT_ID o CLOUDFLARE_API_TOKEN en el .env")
     clean_prompt = re.sub(r"[^\w\s,.\-]", "", prompt_text).strip()[:800]
-    endpoint = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID.strip()}/ai/run/{CF_MODEL}"
+    endpoint = f"[https://api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){CF_ACCOUNT_ID.strip()}/ai/run/{CF_MODEL}"
     body_data = json.dumps({"prompt": clean_prompt, "steps": 4}).encode("utf-8")
     headers = {"Authorization": f"Bearer {CF_API_TOKEN.strip()}", "Content-Type": "application/json", "User-Agent": "FabricaVideos/1.0"}
     FINAL_WIDTH, FINAL_HEIGHT = 1920, 1080
@@ -332,7 +457,7 @@ def _generate_ai_image(prompt_text: str, output_path: Path, max_retries: int = 3
         except urllib.error.HTTPError as err:
             last_error = err
             err_body = err.read().decode("utf-8", errors="ignore")
-            print(f"      [Cloudflare HTTP {err.code}] {err_body[:200]}")
+            print(f"      [Cloudflare HTTP {err.code}] {err_body[:200]}", flush=True)
             if attempt < max_retries - 1:
                 time.sleep(4 if err.code == 429 else 2)
                 continue
@@ -346,6 +471,25 @@ def _generate_ai_image(prompt_text: str, output_path: Path, max_retries: int = 3
         raise last_error
 
 
+def sanitizar_prompt_anti_texto(prompt_en: str) -> str:
+    t = prompt_en
+    frases_negativas = [
+        r",\s*strictly no text.*",
+        r",\s*no text.*",
+        r",\s*no letters.*",
+        r",\s*without letters.*",
+    ]
+    for fn in frases_negativas:
+        t = re.sub(fn, "", t, flags=re.IGNORECASE)
+
+    t = re.sub(r"(?i)\b(cockpit )?weight[- ]and[- ]balance screen\b", "cockpit control yoke, throttle quadrant and glowing illuminated instruments", t)
+    t = re.sub(r"(?i)\bcockpit screen\b", "cockpit instrument panel with glowing analog dials and switches", t)
+    t = re.sub(r"(?i)\b(computer|terminal|data|server) screen\b", "server rack LED telemetry status lights", t)
+    t = re.sub(r"(?i)\b(touchscreen|monitor|display screen)\b", "dark instrument panel with abstract glow", t)
+    t = re.sub(r"(?i)\b(showing|displaying) (data|text|code|metrics|values)\b", "showing abstract geometric thermal telemetry", t)
+    return f"{t.strip()}, minimal industrial aesthetic, clean surface, cinematic shallow depth of field"
+
+
 def provision_asset(storyboard_item: dict, project_id: str = "default",
                     estilo_global: str | None = None, entidades: dict | None = None) -> dict:
     item_id = storyboard_item["id"]
@@ -355,17 +499,20 @@ def provision_asset(storyboard_item: dict, project_id: str = "default",
     shot_type = storyboard_item.get("shot_type", "ai_generated")
     estilo_global = estilo_global or "Cinematic documentary style, realistic lighting, high detail"
     entidades = entidades or {}
-    prompt_final = storyboard_item.get("prompt_en") or construir_prompt_imagen(desc, estilo_global, entidades)
-    print(f"-> Generando imagen para plano {item_id}: {prompt_final[:80]}...")
+
+    prompt_base = storyboard_item.get("prompt_en") or construir_prompt_imagen(desc, estilo_global, entidades)
+    prompt_final = sanitizar_prompt_anti_texto(prompt_base)
+
+    print(f"-> Generando imagen para plano {item_id}: {prompt_final[:80]}...", flush=True)
     try:
         _generate_ai_image(prompt_final, filepath)
-        print(f"   [OK] Imagen guardada en {filename}")
+        print(f"   [OK] Imagen guardada en {filename}", flush=True)
         return {"status": "ready", "type": "image", "url": f"http://localhost:8000/renders/assets/{filename}",
                 "provider": "cloudflare-workers-ai", "duration_seconds": storyboard_item.get("duration_seconds", 4.0),
                 "error_message": None}
     except Exception as err:
         motivo = str(err)[:300]
-        print(f"   [Fallo definitivo] {item_id} ({motivo}). Usando tarjeta gráfica.")
+        print(f"   [Fallo definitivo] {item_id} ({motivo}). Usando tarjeta gráfica.", flush=True)
         _create_slide_image(desc, shot_type, filepath)
         return {"status": "error", "type": "image", "url": f"http://localhost:8000/renders/assets/{filename}",
                 "provider": "fallback-slide", "duration_seconds": storyboard_item.get("duration_seconds", 4.0),
@@ -392,13 +539,13 @@ def _detect_aspect_ratio(project) -> str:
 
 
 # ============================================================================
-# KEN BURNS (zoom suave) — versión corregida contra el jitter
+# KEN BURNS (zoom suave) — lienzo 6000px contra jitter
 # ============================================================================
 
 KENBURNS_FPS = 30
 KENBURNS_ZOOM_START = 1.0
 KENBURNS_ZOOM_END = 1.08
-KENBURNS_UPSCALE_LONG_EDGE = 6000   # 6000px para eliminar el tirón y cuantización
+KENBURNS_UPSCALE_LONG_EDGE = 6000
 
 
 def _build_kenburns_segment(img_path: Path, seg_path: Path, duration: float,
@@ -459,10 +606,158 @@ def _build_kenburns_segment(img_path: Path, seg_path: Path, duration: float,
 
 
 # ============================================================================
-# TTS + SUBTÍTULOS
+# TTS: MOTOR HÍBRIDO (AZURE OFICIAL COMO PRINCIPAL + EDGE-TTS COMO RESPALDO)
 # ============================================================================
 
-async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Path) -> list[dict]:
+def _synthesize_azure_tts(text: str, voice: str, output_path: Path) -> list[dict]:
+    """Síntesis oficial autenticada con Azure Speech SDK (sin errores 403 y con limpieza tolerante a Windows)."""
+    speech_key = os.getenv("AZURE_SPEECH_KEY")
+    speech_region = os.getenv("AZURE_SPEECH_REGION", "northeurope")
+
+    if not voice or "Neural" not in voice:
+        voice = "es-ES-AlvaroNeural"
+
+    def _split_text(s: str, max_len: int = 600) -> list[str]:
+        frases = re.split(r'(?<=[\.\!\?\:;])\s+', s.strip())
+        chunks, actual = [], ""
+        for f in frases:
+            if not f:
+                continue
+            if len(actual) + len(f) + 1 <= max_len:
+                actual = (actual + " " + f).strip()
+            else:
+                if actual:
+                    chunks.append(actual)
+                actual = f
+        if actual:
+            chunks.append(actual)
+        return [c for c in chunks if c.strip()]
+
+    chunks = _split_text(text, max_len=600)
+    print(f"\n[Azure Speech] Sintetizando {len(chunks)} bloques con '{voice}'...", flush=True)
+
+    tmp_dir = output_path.parent / f"_tts_tmp_{uuid.uuid4().hex[:6]}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_files: list[Path] = []
+    chunk_boundaries: list[list[dict]] = []
+    chunk_durations: list[float] = []
+
+    for idx, chunk in enumerate(chunks):
+        chunk_path = tmp_dir / f"chunk_{idx:03d}.mp3"
+        chunk_files.append(chunk_path)
+        chunk_limpio = chunk.replace("...", " — ").replace(" - ", ", ")
+
+        speech_config = speechsdk.SpeechConfig(subscription=speech_key.strip(), region=speech_region.strip())
+        speech_config.speech_synthesis_voice_name = voice
+        speech_config.set_speech_synthesis_output_format(
+            speechsdk.SpeechSynthesisOutputFormat.Audio16Khz128KBitRateMonoMp3
+        )
+        audio_config = speechsdk.audio.AudioOutputConfig(filename=str(chunk_path.resolve()))
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+
+        boundaries: list[dict] = []
+
+        def word_cb(evt):
+            is_word = getattr(evt, "boundary_type", None) == speechsdk.SpeechSynthesisBoundaryType.Word
+            if is_word and evt.text:
+                dur_sec = evt.duration.total_seconds() if hasattr(evt.duration, "total_seconds") else (float(evt.duration) / 10_000_000.0)
+                start_sec = float(evt.audio_offset) / 10_000_000.0
+                boundaries.append({"text": evt.text, "start": start_sec, "end": start_sec + dur_sec})
+
+        synthesizer.synthesis_word_boundary.connect(word_cb)
+
+        escaped = (
+            chunk_limpio.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+        )
+        ssml = (
+            f'<speak version="1.0" xmlns="[http://www.w3.org/2001/10/synthesis](http://www.w3.org/2001/10/synthesis)" xml:lang="es-ES">'
+            f'<voice name="{voice}"><prosody rate="+6%">{escaped}</prosody></voice></speak>'
+        )
+
+        res = synthesizer.speak_ssml_async(ssml).get()
+        if res.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+            boundaries.clear()
+            res = synthesizer.speak_text_async(chunk_limpio).get()
+
+        if res.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+            details = res.cancellation_details
+            raise RuntimeError(f"Error en Azure: {details.reason} - {details.error_details}")
+
+        palabras_orig = [w for w in chunk_limpio.split() if any(c.isalnum() for c in w)]
+        if len(palabras_orig) == len(boundaries):
+            for b, orig_w in zip(boundaries, palabras_orig):
+                b["text"] = orig_w
+
+        dur = _get_audio_duration(chunk_path)
+        chunk_boundaries.append(boundaries)
+        chunk_durations.append(dur)
+        print(f"[Azure Speech] Bloque {idx+1}/{len(chunks)}: {len(boundaries)} palabras, {dur:.2f}s.", flush=True)
+
+        # Liberar descriptores de archivos de C++ en Windows inmediatamente
+        del synthesizer
+        del audio_config
+        time.sleep(0.05)
+
+    # Forzar recolección de basura para cerrar cualquier handle nativo abierto
+    gc.collect()
+
+    concat_txt = None
+    if len(chunk_files) == 1:
+        shutil.copyfile(chunk_files[0], output_path)
+    else:
+        concat_txt = tmp_dir / "concat.txt"
+        with open(concat_txt, "w", encoding="utf-8") as f:
+            for cf in chunk_files:
+                f.write(f"file '{cf.resolve().as_posix()}'\n")
+
+        res_join = subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_txt), "-c", "copy", str(output_path)
+        ], capture_output=True, text=True)
+        if res_join.returncode != 0:
+            raise RuntimeError(f"Fallo al unir chunks TTS: {res_join.stderr}")
+
+    palabras: list[dict] = []
+    offset = 0.0
+    for boundaries, dur in zip(chunk_boundaries, chunk_durations):
+        for b in boundaries:
+            palabras.append({"text": b["text"], "start": offset + b["start"], "end": offset + b["end"]})
+        offset += dur
+
+    dur_final = _get_audio_duration(output_path)
+    if palabras and dur_final > 0:
+        fin_est = palabras[-1]["end"]
+        if fin_est > 0 and abs(dur_final - fin_est) > 0.5:
+            factor = dur_final / fin_est
+            for p in palabras:
+                p["start"] *= factor
+                p["end"] *= factor
+
+    # Limpieza defensiva en Windows: protegida contra WinError 32
+    for cf in chunk_files:
+        try:
+            cf.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if concat_txt and concat_txt.exists():
+        try:
+            concat_txt.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except OSError:
+        pass
+
+    return palabras
+
+
+async def _synthesize_edge_tts(text: str, voice: str, output_path: Path) -> list[dict]:
+    """Función original de Edge-TTS guardada para respaldo futuro."""
     def _split_text(s: str, max_len: int = 350) -> list[str]:
         frases = re.split(r'(?<=[\.\!\?\:;])\s+', s.strip())
         chunks, actual = [], ""
@@ -488,7 +783,7 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
         return [c for c in chunks if c.strip()]
 
     chunks = _split_text(text, max_len=350)
-    print(f"[TTS] Texto troceado en {len(chunks)} bloques.")
+    print(f"[Edge-TTS] Texto troceado en {len(chunks)} bloques.", flush=True)
 
     tmp_dir = output_path.parent / f"_tts_tmp_{uuid.uuid4().hex[:6]}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -501,36 +796,43 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
         chunk_path = tmp_dir / f"chunk_{idx:03d}.mp3"
         chunk_files.append(chunk_path)
         boundaries: list[dict] = []
-
         chunk_limpio = chunk.replace("...", " — ").replace(" - ", ", ")
-        try:
-            communicate = edge_tts.Communicate(chunk_limpio, voice, rate="+6%", pitch="+0Hz", boundary="WordBoundary")
-            with open(chunk_path, "wb") as f:
-                async for piece in communicate.stream():
-                    if isinstance(piece, dict):
-                        ptype = piece.get("type")
-                        data = piece.get("data")
-                        offset = piece.get("offset")
-                        duration = piece.get("duration")
-                        text_w = piece.get("text")
-                    else:
-                        ptype = getattr(piece, "type", None)
-                        data = getattr(piece, "data", None)
-                        offset = getattr(piece, "offset", None)
-                        duration = getattr(piece, "duration", None)
-                        text_w = getattr(piece, "text", None)
+        exito = False
+        ultimo_error_tts = None
 
-                    if ptype == "audio" and data:
-                        f.write(data)
-                    elif ptype == "WordBoundary" and offset is not None and duration is not None:
-                        boundaries.append({
-                            "text": text_w or "",
-                            "start": offset / 10_000_000,
-                            "end": (offset + duration) / 10_000_000,
-                        })
-        except Exception as e:
-            print(f"[TTS] Error en bloque {idx+1}: {e}")
-            chunk_path.touch(exist_ok=True)
+        for intento in range(3):
+            boundaries.clear()
+            try:
+                communicate = edge_tts.Communicate(chunk_limpio, voice, rate="+6%", pitch="+0Hz", boundary="WordBoundary")
+                with open(chunk_path, "wb") as f:
+                    async for piece in communicate.stream():
+                        ptype = piece.get("type") if isinstance(piece, dict) else getattr(piece, "type", None)
+                        data = piece.get("data") if isinstance(piece, dict) else getattr(piece, "data", None)
+                        offset = piece.get("offset") if isinstance(piece, dict) else getattr(piece, "offset", None)
+                        duration = piece.get("duration") if isinstance(piece, dict) else getattr(piece, "duration", None)
+                        text_w = piece.get("text") if isinstance(piece, dict) else getattr(piece, "text", None)
+
+                        if ptype == "audio" and data:
+                            f.write(data)
+                        elif ptype == "WordBoundary" and offset is not None and duration is not None:
+                            boundaries.append({
+                                "text": text_w or "",
+                                "start": offset / 10_000_000,
+                                "end": (offset + duration) / 10_000_000,
+                            })
+
+                if chunk_path.exists() and chunk_path.stat().st_size > 1000:
+                    exito = True
+                    break
+                else:
+                    raise IOError(f"Audio vacío ({chunk_path.stat().st_size} bytes)")
+            except Exception as e:
+                ultimo_error_tts = e
+                print(f"[Edge-TTS] Reintento {intento + 1}/3 en bloque {idx + 1}: {e}", flush=True)
+                await asyncio.sleep(1.5)
+
+        if not exito:
+            raise RuntimeError(f"Fallo definitivo en Edge-TTS: {ultimo_error_tts}")
 
         palabras_orig = [w for w in chunk_limpio.split() if any(c.isalnum() for c in w)]
         if len(palabras_orig) == len(boundaries):
@@ -540,74 +842,65 @@ async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Pat
         dur = _get_audio_duration(chunk_path)
         chunk_boundaries.append(boundaries)
         chunk_durations.append(dur)
-        print(f"[TTS] Bloque {idx+1}/{len(chunks)}: {len(boundaries)} WordBoundary, {dur:.2f}s de audio.")
+        await asyncio.sleep(0.3)
 
     concat_txt = tmp_dir / "concat.txt"
     with open(concat_txt, "w", encoding="utf-8") as f:
         for cf in chunk_files:
             f.write(f"file '{cf.resolve().as_posix()}'\n")
 
-    res_join = subprocess.run([
+    subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
         "-i", str(concat_txt), "-c", "copy", str(output_path)
-    ], capture_output=True, text=True)
-    if res_join.returncode != 0:
-        raise RuntimeError(f"Fallo al unir chunks TTS: {res_join.stderr}")
+    ], check=True, capture_output=True)
 
-    total_boundaries = sum(len(b) for b in chunk_boundaries)
     palabras: list[dict] = []
     offset = 0.0
-
-    if total_boundaries > 0:
-        for boundaries, dur in zip(chunk_boundaries, chunk_durations):
-            for b in boundaries:
-                palabras.append({
-                    "text": b["text"],
-                    "start": offset + b["start"],
-                    "end": offset + b["end"],
-                })
-            offset += dur
-    else:
-        print("[TTS] Sin WordBoundary: usando fallback proporcional por bloque.")
-        for chunk, dur in zip(chunks, chunk_durations):
-            ws = chunk.split()
-            if not ws or dur <= 0:
-                offset += dur
-                continue
-            pesos = [max(len(w), 3) for w in ws]
-            total_peso = sum(pesos)
-            sub = 0.0
-            for w, p in zip(ws, pesos):
-                d = dur * (p / total_peso)
-                palabras.append({
-                    "text": w,
-                    "start": offset + sub,
-                    "end": offset + sub + d,
-                })
-                sub += d
-            offset += dur
+    for boundaries, dur in zip(chunk_boundaries, chunk_durations):
+        for b in boundaries:
+            palabras.append({"text": b["text"], "start": offset + b["start"], "end": offset + b["end"]})
+        offset += dur
 
     dur_final = _get_audio_duration(output_path)
     if palabras and dur_final > 0:
-        ultimo_fin = palabras[-1]["end"]
-        if ultimo_fin > 0 and abs(dur_final - ultimo_fin) > 0.5:
-            factor = dur_final / ultimo_fin
-            print(f"[TTS] Reajuste fino: x{factor:.4f} "
-                  f"(fin estimado {ultimo_fin:.2f}s → audio real {dur_final:.2f}s)")
+        fin_est = palabras[-1]["end"]
+        if fin_est > 0 and abs(dur_final - fin_est) > 0.5:
+            factor = dur_final / fin_est
             for p in palabras:
                 p["start"] *= factor
                 p["end"] *= factor
 
     for cf in chunk_files:
-        cf.unlink(missing_ok=True)
-    concat_txt.unlink(missing_ok=True)
+        try:
+            cf.unlink(missing_ok=True)
+        except OSError:
+            pass
     try:
-        tmp_dir.rmdir()
+        concat_txt.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     except OSError:
         pass
 
-    print(f"[Subtítulos] Total de palabras sincronizadas: {len(palabras)}")
     return palabras
+
+
+async def _synthesize_tts_con_timestamps(text: str, voice: str, output_path: Path) -> list[dict]:
+    """Punto de entrada principal llamado por render_video."""
+    tts_provider = os.getenv("TTS_PROVIDER", "azure").lower()
+
+    if tts_provider == "azure" and os.getenv("AZURE_SPEECH_KEY"):
+        return _synthesize_azure_tts(text, voice, output_path)
+
+    try:
+        return await _synthesize_edge_tts(text, voice, output_path)
+    except Exception as e:
+        if os.getenv("AZURE_SPEECH_KEY"):
+            print(f"[TTS Fallback] Edge-TTS falló ({e}). Conmutando automáticamente a Azure Speech...", flush=True)
+            return _synthesize_azure_tts(text, voice, output_path)
+        raise e
 
 
 def _formatear_tiempo_ass(segundos: float) -> str:
@@ -618,6 +911,7 @@ def _formatear_tiempo_ass(segundos: float) -> str:
 
 
 def _generar_subtitulos_ass(palabras: list[dict], output_path: Path,
+                            diccionario_reversion: dict | None = None,
                             max_palabras_por_cue: int = 4, max_segundos_por_cue: float = 2.2,
                             resolution: tuple[int, int] = (1920, 1080), is_vertical: bool = False) -> bool:
     if not palabras:
@@ -632,10 +926,12 @@ def _generar_subtitulos_ass(palabras: list[dict], output_path: Path,
 
     def _cerrar_cue():
         if actual:
+            raw_text = " ".join(p["text"] for p in actual).strip()
+            clean_text = restaurar_ortografia_subtitulos(raw_text, diccionario_reversion or {})
             cues.append({
                 "start": actual[0]["start"],
                 "end": actual[-1]["end"],
-                "text": " ".join(p["text"] for p in actual).strip()
+                "text": clean_text
             })
 
     PUNTUACION_TERMINAL = {".", "!", "?", ":", ";", "—"}
@@ -687,7 +983,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         lineas.append(f"Dialogue: 0,{_formatear_tiempo_ass(cue['start'])},{_formatear_tiempo_ass(cue['end'])},Default,,0,0,0,,{texto}")
         
     output_path.write_text(header + "\n".join(lineas) + "\n", encoding="utf-8")
-    print(f"[Subtítulos] Archivo .ass generado: {output_path.name}")
+    print(f"[Subtítulos] Archivo .ass generado: {output_path.name}", flush=True)
     return True
 
 
@@ -720,7 +1016,7 @@ def _get_audio_duration(audio_path: Path) -> float:
 
 
 # ============================================================================
-# RENDER PRINCIPAL
+# 3. RENDER PRINCIPAL (CON FONÉTICA DINÁMICA, OUTRO Y FEEDBACK EN VIVO)
 # ============================================================================
 
 def render_video(project) -> dict:
@@ -735,59 +1031,75 @@ def render_video(project) -> dict:
     script_blocks = project.script or []
     raw_text = " ".join([b.get("text", "") for b in script_blocks]) or project.description or project.title
 
-    # AISLAMIENTO ESTRICTO: Purga acotaciones de cámara, corchetes y B-roll antes del audio
-    full_voice_text = limpiar_texto_locucion(raw_text)
+    texto_locucion_limpio = limpiar_texto_locucion(raw_text)
+    dicc_fonetica, dicc_reversion = generar_diccionarios_foneticos(texto_locucion_limpio, project_id=project.id)
+    full_voice_text = aplicar_sustitucion_fonetica(texto_locucion_limpio, dicc_fonetica)
 
     audio_path = RENDERS_DIR / f"{project.id}_voice.mp3"
     voice_name = "es-ES-AlvaroNeural"
     if project.voice_selection and isinstance(project.voice_selection, dict):
         voice_name = project.voice_selection.get("provider_voice_id", voice_name)
 
-    # 1) TTS con timestamps reales por palabra
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # Ejecución asíncrona robusta tolerante a hilos de FastAPI y CLI
     try:
-        palabras = loop.run_until_complete(_synthesize_tts_con_timestamps(full_voice_text, voice_name, audio_path))
-    finally:
-        loop.close()
+        active_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        active_loop = None
+
+    if active_loop and active_loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            palabras = pool.submit(
+                lambda: asyncio.run(_synthesize_tts_con_timestamps(full_voice_text, voice_name, audio_path))
+            ).result()
+    else:
+        palabras = asyncio.run(_synthesize_tts_con_timestamps(full_voice_text, voice_name, audio_path))
 
     audio_file_duration = _get_audio_duration(audio_path)
     last_word_end = palabras[-1]["end"] if palabras else audio_file_duration
-    print(f"[Sync] Duración MP3 (ffprobe): {audio_file_duration:.2f}s | "
-          f"Fin real locución: {last_word_end:.2f}s | "
-          f"Silencio de cola: {audio_file_duration - last_word_end:.2f}s")
+    print(f"\n[Sync] Duración MP3 (ffprobe): {audio_file_duration:.2f}s | Fin locución: {last_word_end:.2f}s", flush=True)
 
-    # 2) Ajustar duraciones de planos para que su suma == fin real de la locución
     storyboard = list(project.storyboard or [])
     total_shot_duration = sum(float(s.get("duration_seconds", 3.0)) for s in storyboard)
 
     if total_shot_duration > 0 and last_word_end > 0.1:
         factor = last_word_end / total_shot_duration
         if abs(factor - 1.0) > 0.005:
-            print(f"[Sync] Ajustando {len(storyboard)} planos: factor={factor:.4f} "
-                  f"({total_shot_duration:.2f}s → {last_word_end:.2f}s)")
+            print(f"[Sync] Ajustando {len(storyboard)} planos: factor={factor:.4f} ({total_shot_duration:.2f}s → {last_word_end:.2f}s)", flush=True)
             for s in storyboard:
                 s["duration_seconds"] = round(float(s.get("duration_seconds", 3.0)) * factor, 4)
         else:
-            print(f"[Sync] Duraciones ya coinciden (factor={factor:.4f}). Sin ajuste.")
-    else:
-        print("[Sync] Aviso: duración total de planos o locución no válida.")
+            print(f"[Sync] Duraciones coinciden (factor={factor:.4f}).", flush=True)
 
-    # 3) Subtítulos .ass (con los timestamps REALES del audio, sin escalar)
+    if storyboard:
+        duracion_original_ultimo = float(storyboard[-1].get("duration_seconds", 3.0))
+        storyboard[-1]["duration_seconds"] = round(duracion_original_ultimo + OUTRO_BUFFER_SECONDS, 4)
+        print(f"[Outro] Plano final extendido +{OUTRO_BUFFER_SECONDS}s para tarjetas de YouTube.", flush=True)
+
+    total_video_duration = last_word_end + OUTRO_BUFFER_SECONDS
+
     subs_path = RENDERS_DIR / f"{project.id}_subs.ass"
-    tiene_subtitulos = _generar_subtitulos_ass(palabras, subs_path,
-                                                resolution=(target_w, target_h), is_vertical=is_vertical)
+    tiene_subtitulos = _generar_subtitulos_ass(
+        palabras, subs_path,
+        diccionario_reversion=dicc_reversion,
+        resolution=(target_w, target_h), is_vertical=is_vertical
+    )
 
-    # 4) Segmentos con Ken Burns (zoom suave, canvas grande)
+    # 5. Segmentos con Ken Burns con progreso visible en tiempo real
     segment_files = []
+    total_shots = len(storyboard)
+    print(f"\n[FFmpeg] Iniciando montaje de {total_shots} planos de vídeo...", flush=True)
+
     for i, shot in enumerate(storyboard):
-        duration = float(shot.get("duration_seconds", 3.0))
+        duration = max(0.5, float(shot.get("duration_seconds", 3.0)))
         img_path = ASSETS_DIR / f"{project.id}_{shot['id']}.png"
         if not img_path.exists():
             _create_slide_image(shot.get("description", "Escena"), "graphic", img_path)
             
         focus_x = int(shot.get("focus_x", 50))
         focus_y = int(shot.get("focus_y", 50))
+        
+        # Feedback continuo en terminal para evitar sensación de congelamiento
+        print(f"[FFmpeg] Procesando plano {i+1}/{total_shots} ({duration:.1f}s)...", flush=True)
         
         seg_path = RENDERS_DIR / f"{project.id}_seg_{i}.mp4"
         cmd = _build_kenburns_segment(img_path, seg_path, duration, target_w, target_h, is_vertical, i, focus_x, focus_y)
@@ -796,7 +1108,8 @@ def render_video(project) -> dict:
             raise RuntimeError(f"Fallo de FFmpeg en el plano {shot['id']}: {res.stderr}")
         segment_files.append(seg_path)
 
-    # 5) Concatenar
+    # 6. Concatenar
+    print(f"\n[FFmpeg] Uniendo los {len(segment_files)} clips concatenados...", flush=True)
     concat_list_path = RENDERS_DIR / f"{project.id}_concat.txt"
     with open(concat_list_path, "w", encoding="utf-8") as f:
         for seg in segment_files:
@@ -815,7 +1128,8 @@ def render_video(project) -> dict:
     if res_concat.returncode != 0:
         raise RuntimeError(f"Fallo al concatenar: {res_concat.stderr}")
 
-    # 6) Mix final
+    # 7. Mix final con ducking y subtítulos
+    print("[FFmpeg] Realizando mezcla final de audio, música y subtítulos...", flush=True)
     bgm_category = getattr(project, "bgm_category", None) or "documental"
     bgm_path = _elegir_pista_bgm(bgm_category)
     inputs = ["-i", str(full_video_temp), "-i", str(audio_path)]
@@ -828,14 +1142,17 @@ def render_video(project) -> dict:
 
     if bgm_path:
         inputs += ["-stream_loop", "-1", "-i", str(bgm_path)]
+        fade_start = max(0.0, total_video_duration - 2.0)
         filter_parts.append(
-            "[2:a]volume=0.28[bgm_vol];"
-            "[bgm_vol][1:a]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=400[bgm_duck];"
-            "[1:a][bgm_duck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
+            f"[1:a]apad=pad_dur={OUTRO_BUFFER_SECONDS},asplit=2[voice_duck][voice_mix];"
+            f"[2:a]volume=0.28[bgm_vol];"
+            f"[bgm_vol][voice_duck]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=600[bgm_duck];"
+            f"[voice_mix][bgm_duck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,afade=t=out:st={fade_start:.2f}:d=2.0[aout]"
         )
         audio_map = "[aout]"
     else:
-        audio_map = "1:a"
+        filter_parts.append(f"[1:a]apad=pad_dur={OUTRO_BUFFER_SECONDS}[aout]")
+        audio_map = "[aout]"
 
     cmd_final = ["ffmpeg", "-y", *inputs]
     if filter_parts:
@@ -847,11 +1164,22 @@ def render_video(project) -> dict:
     if res_final.returncode != 0:
         raise RuntimeError(f"Fallo al mezclar audio y subtítulos: {res_final.stderr}")
 
+    # Limpieza final de temporales a prueba de bloqueos de Windows
     for seg in segment_files:
-        seg.unlink(missing_ok=True)
-    concat_list_path.unlink(missing_ok=True)
-    full_video_temp.unlink(missing_ok=True)
+        try:
+            seg.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        concat_list_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        full_video_temp.unlink(missing_ok=True)
+    except OSError:
+        pass
 
+    print(f"\n🎉 ¡Vídeo final generado con éxito!: {output_path.resolve()}", flush=True)
     return {"final_video_url": f"http://localhost:8000/renders/{output_filename}"}
 
 
@@ -862,7 +1190,7 @@ def render_video(project) -> dict:
 if __name__ == "__main__":
     import types as _types
     DEMO_ID = "demo"
-    print("\n=== DEMO FÁBRICA DE VÍDEOS ===\n")
+    print("\n=== DEMO FÁBRICA DE VÍDEOS ===\n", flush=True)
 
     demo_storyboard = [
         {"id": "s1", "order": 1, "description": "Primer plano del Nintendo Entertainment System.",
@@ -900,17 +1228,17 @@ if __name__ == "__main__":
         aspect_ratio="16:9",
     )
 
-    print("Generando assets de prueba...")
+    print("Generando assets de prueba...", flush=True)
     for shot in demo_storyboard:
         img_path = ASSETS_DIR / f"{DEMO_ID}_{shot['id']}.png"
         if not img_path.exists():
             try:
                 provision_asset(shot, project_id=DEMO_ID)
             except Exception as e:
-                print(f"  Fallback gráfico para {shot['id']}: {e}")
+                print(f"  Fallback gráfico para {shot['id']}: {e}", flush=True)
                 _create_slide_image(shot["description"], shot["shot_type"], img_path)
 
-    print("\nRenderizando vídeo...\n")
+    print("\nRenderizando vídeo...\n", flush=True)
     result = render_video(demo_project)
-    print(f"\n✅ Vídeo generado: {result['final_video_url']}")
-    print(f"   Archivo local: {RENDERS_DIR}/")
+    print(f"\n✅ Vídeo generado: {result['final_video_url']}", flush=True)
+    print(f"   Archivo local: {RENDERS_DIR}/", flush=True)
